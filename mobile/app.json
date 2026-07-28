@@ -1,0 +1,47 @@
+{
+  "expo": {
+    "name": "Bill Extractor",
+    "slug": "electricity-bill-extractor",
+    "version": "1.0.0",
+    "orientation": "portrait",
+    "icon": "./assets/icon.png",
+    "scheme": "billextractor",
+    "userInterfaceStyle": "light",
+    "ios": {
+      "supportsTablet": true,
+      "bundleIdentifier": "com.billextractor.app",
+      "infoPlist": {
+        "NSCameraUsageDescription": "Bill Extractor uses the camera to photograph your electricity bill so the details can be read from it.",
+        "NSPhotoLibraryUsageDescription": "Bill Extractor needs access to your photos so you can pick a saved bill image."
+      }
+    },
+    "android": {
+      "package": "com.billextractor.app",
+      "adaptiveIcon": {
+        "backgroundColor": "#0f172a",
+        "foregroundImage": "./assets/android-icon-foreground.png",
+        "backgroundImage": "./assets/android-icon-background.png",
+        "monochromeImage": "./assets/android-icon-monochrome.png"
+      },
+      "predictiveBackGestureEnabled": false,
+      "permissions": ["android.permission.CAMERA"]
+    },
+    "web": {
+      "favicon": "./assets/favicon.png"
+    },
+    "plugins": [
+      [
+        "expo-camera",
+        {
+          "cameraPermission": "Allow Bill Extractor to use the camera to photograph your electricity bill."
+        }
+      ],
+      [
+        "expo-image-picker",
+        {
+          "photosPermission": "Allow Bill Extractor to access your photos so you can pick a saved bill image."
+        }
+      ]
+    ]
+  }
+}
