@@ -6,7 +6,6 @@ import {
   Alert,
   KeyboardAvoidingView,
   Platform,
-  Pressable,
   ScrollView,
   StyleSheet,
   Text,
@@ -14,6 +13,7 @@ import {
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import FieldCard from "../components/FieldCard";
+import SafeButton from "../components/SafeButton";
 import { colors, radius, spacing } from "../lib/theme";
 import { FIELD_META, type BillFieldKey, type ExtractionResult } from "../lib/types";
 
@@ -149,13 +149,13 @@ export default function ResultsScreen({
 
           {rawText ? (
             <View style={styles.card}>
-              <Pressable
+              <SafeButton
                 style={styles.rawToggle}
                 onPress={() => setShowRawText((previous) => !previous)}
               >
                 <Text style={styles.rawToggleLabel}>Raw text read from the bill</Text>
                 <Text style={styles.rawToggleAction}>{showRawText ? "Hide" : "Show"}</Text>
-              </Pressable>
+              </SafeButton>
               {showRawText && (
                 <ScrollView style={styles.rawBox} nestedScrollEnabled>
                   <Text style={styles.rawText}>{rawText}</Text>
@@ -165,17 +165,17 @@ export default function ResultsScreen({
           ) : null}
 
           <View style={styles.actions}>
-            <Pressable style={styles.secondaryButton} onPress={handleCopy}>
+            <SafeButton style={styles.secondaryButton} onPress={handleCopy}>
               <Text style={styles.secondaryButtonText}>
                 {copied ? "Copied!" : "Copy as JSON"}
               </Text>
-            </Pressable>
-            <Pressable style={styles.secondaryButton} onPress={handleShareCsv}>
+            </SafeButton>
+            <SafeButton style={styles.secondaryButton} onPress={handleShareCsv}>
               <Text style={styles.secondaryButtonText}>Export CSV</Text>
-            </Pressable>
-            <Pressable style={styles.primaryButton} onPress={onStartOver}>
+            </SafeButton>
+            <SafeButton style={styles.primaryButton} onPress={onStartOver}>
               <Text style={styles.primaryButtonText}>Scan Another Bill</Text>
-            </Pressable>
+            </SafeButton>
           </View>
         </ScrollView>
       </KeyboardAvoidingView>

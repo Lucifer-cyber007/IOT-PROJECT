@@ -1,5 +1,6 @@
-import { ActivityIndicator, Pressable, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import SafeButton from "../components/SafeButton";
 import { colors, radius, spacing } from "../lib/theme";
 
 interface ProcessingScreenProps {
@@ -22,12 +23,12 @@ export default function ProcessingScreen({
           <Text style={styles.title}>We couldn&apos;t read that bill</Text>
           <Text style={styles.errorBody}>{error}</Text>
 
-          <Pressable style={styles.primaryButton} onPress={onRetry}>
+          <SafeButton style={styles.primaryButton} onPress={onRetry}>
             <Text style={styles.primaryButtonText}>Try Again</Text>
-          </Pressable>
-          <Pressable style={styles.secondaryButton} onPress={onStartOver}>
+          </SafeButton>
+          <SafeButton style={styles.secondaryButton} onPress={onStartOver}>
             <Text style={styles.secondaryButtonText}>Start Over</Text>
-          </Pressable>
+          </SafeButton>
         </View>
       </SafeAreaView>
     );

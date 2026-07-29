@@ -25,7 +25,7 @@ export interface PickedFile {
 }
 
 export type ExtractOutcome =
-  | { kind: "success"; data: ExtractionResult }
+  | { kind: "success"; data: ExtractionResult; rawText: string }
   /** OCR worked but the fields could not be structured - fall back to manual entry. */
   | { kind: "manual_fallback"; message: string; rawText: string };
 
@@ -60,7 +60,7 @@ export async function extractBill(file: PickedFile): Promise<ExtractOutcome> {
 
   let response: Response;
   try {
-    response = await fetch(`${API_BASE_URL}/api/extract`, {
+    response = await fetch(`${API_BASE_URL}/api/extract?include_raw_text=1`, {
       method: "POST",
       body: formData,
       signal: controller.signal,
@@ -106,5 +106,10 @@ export async function extractBill(file: PickedFile): Promise<ExtractOutcome> {
     );
   }
 
-  return { kind: "success", data: body as ExtractionResult };
+  const { raw_text, ...data } = body as ExtractionResult & { raw_text?: string };
+  return {
+    kind: "success",
+    data: data as ExtractionResult,
+    rawText: typeof raw_text === "string" ? raw_text : "",
+  };
 }

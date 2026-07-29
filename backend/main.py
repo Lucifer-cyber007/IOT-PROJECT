@@ -1,6 +1,10 @@
-"""Electricity Bill Extractor - FastAPI backend.
+"""Multi-tenant IoT monitoring API.
 
-Flow: upload -> (PDF rasterize) -> Google Cloud Vision OCR -> Groq field extraction -> JSON.
+Flow: an authenticated client uploads a scan -> OCR -> auto-detect which of
+their own registered machines it belongs to (matching.py, by identifier value)
+-> template-driven field extraction (llm_parser.py, schema comes from the
+matched machine's MachineTemplate) -> reviewed client-side -> persisted as a
+Reading via POST /api/readings.
 """
 
 from __future__ import annotations
@@ -9,17 +13,23 @@ import logging
 import os
 
 from dotenv import load_dotenv
-from fastapi import FastAPI, File, UploadFile
+from fastapi import Depends, FastAPI, File, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
+from sqlalchemy.orm import Session
 
-from llm_parser import LlmError, LlmParseError, parse_bill
+import auth
+import models
+import schemas
+from db import Base, engine, get_db
+from llm_parser import LlmError, LlmParseError, parse_document
+from matching import find_matching_machines
 from vision_ocr import OcrError, prepare_images, run_ocr
 
 load_dotenv()
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
-logger = logging.getLogger("bill_extractor")
+logger = logging.getLogger("iot_backend")
 
 ALLOWED_MIME_TYPES = {
     "image/jpeg",
@@ -28,23 +38,10 @@ ALLOWED_MIME_TYPES = {
     "image/webp",
     "application/pdf",
 }
-
 ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
-
-MOCK_RESPONSE = {
-    "name": "RAMESH KUMAR S",
-    "rr_number": "HB123456",
-    "address": "No 42, 3rd Cross, Jayanagar 4th Block, Bengaluru 560011",
-    "account_number": "1234567890",
-    "units_consumed": "142",
-    "amount_to_pay": "1245.60",
-    "tariff": "LT-2(a)",
-    "bill_date": "05-03-2024",
-    "confidence_flags": {"account_number": "low_confidence"},
-}
 
 
 def _allowed_origins() -> list[str]:
@@ -53,9 +50,9 @@ def _allowed_origins() -> list[str]:
 
 
 app = FastAPI(
-    title="Electricity Bill Extractor API",
-    description="Extracts structured billing data from electricity bill images and PDFs.",
-    version="1.0.0",
+    title="Multi-Asset IoT Monitoring API",
+    description="Multi-tenant client/machine/reading platform with template-driven OCR extraction.",
+    version="2.0.0",
 )
 
 app.add_middleware(
@@ -67,41 +64,252 @@ app.add_middleware(
 )
 
 
-def _error(status: int, message: str, **extra) -> JSONResponse:
-    return JSONResponse(status_code=status, content={"detail": message, **extra})
+@app.on_event("startup")
+def on_startup() -> None:
+    Base.metadata.create_all(bind=engine)
 
 
-def _is_mock_mode() -> bool:
-    return os.getenv("MOCK_MODE", "0").strip().lower() in {"1", "true", "yes"}
+def _error(status_code: int, message: str, **extra) -> JSONResponse:
+    return JSONResponse(status_code=status_code, content={"detail": message, **extra})
 
 
 @app.get("/api/health")
 async def health() -> dict:
-    """Cheap readiness probe that also reports which API keys are configured."""
     return {
         "status": "ok",
-        "mock_mode": _is_mock_mode(),
         "vision_key_configured": bool(os.getenv("GOOGLE_CLOUD_VISION_API_KEY")),
         "groq_key_configured": bool(os.getenv("GROQ_API_KEY")),
         "max_upload_mb": MAX_UPLOAD_MB,
     }
 
 
-@app.post("/api/extract")
-async def extract(file: UploadFile = File(...), include_raw_text: bool = False):
-    """Extract structured billing fields from an uploaded bill image or PDF.
+# --- Auth ---------------------------------------------------------------
 
-    Pass `?include_raw_text=1` to also get the raw OCR text back on success. The
-    default response keeps strictly to the documented field schema; the flag is a
-    diagnostic aid for when a field comes out wrong and you need to see what the
-    OCR actually produced.
+
+@app.post("/api/auth/login", response_model=schemas.TokenResponse)
+def login(payload: schemas.LoginRequest, db: Session = Depends(get_db)):
+    user = db.query(models.User).filter(models.User.email == payload.email).first()
+    if not user or not auth.verify_password(payload.password, user.password_hash):
+        raise HTTPException(status_code=401, detail="Invalid email or password.")
+    token = auth.create_access_token(user)
+    return schemas.TokenResponse(access_token=token, role=user.role, client_id=user.client_id)
+
+
+@app.get("/api/auth/me", response_model=schemas.UserOut)
+def me(user: models.User = Depends(auth.get_current_user)):
+    return user
+
+
+# --- Admin: clients -------------------------------------------------------
+
+
+@app.post("/api/admin/clients", response_model=schemas.ClientOut)
+def create_client(
+    payload: schemas.ClientCreate,
+    db: Session = Depends(get_db),
+    _admin: models.User = Depends(auth.require_admin),
+):
+    client = models.Client(name=payload.name)
+    db.add(client)
+    db.commit()
+    db.refresh(client)
+    return client
+
+
+@app.get("/api/admin/clients", response_model=list[schemas.ClientOut])
+def list_clients(db: Session = Depends(get_db), _admin: models.User = Depends(auth.require_admin)):
+    return db.query(models.Client).order_by(models.Client.created_at.desc()).all()
+
+
+# --- Admin: users (client logins) ----------------------------------------
+
+
+@app.post("/api/admin/users", response_model=schemas.UserOut)
+def create_user(
+    payload: schemas.UserCreate,
+    db: Session = Depends(get_db),
+    _admin: models.User = Depends(auth.require_admin),
+):
+    if payload.role not in {"admin", "client"}:
+        raise HTTPException(status_code=400, detail="role must be 'admin' or 'client'.")
+    if payload.role == "client" and payload.client_id is None:
+        raise HTTPException(status_code=400, detail="client_id is required for role 'client'.")
+    if payload.client_id is not None and not db.get(models.Client, payload.client_id):
+        raise HTTPException(status_code=404, detail="Unknown client_id.")
+    if db.query(models.User).filter(models.User.email == payload.email).first():
+        raise HTTPException(status_code=409, detail="A user with that email already exists.")
+
+    user = models.User(
+        email=payload.email,
+        password_hash=auth.hash_password(payload.password),
+        role=payload.role,
+        client_id=payload.client_id,
+    )
+    db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+# --- Admin: asset classes (read-only, seeded) -----------------------------
+
+
+@app.get("/api/admin/asset-classes", response_model=list[schemas.AssetClassOut])
+def list_asset_classes_admin(
+    db: Session = Depends(get_db), _admin: models.User = Depends(auth.require_admin)
+):
+    return db.query(models.AssetClass).all()
+
+
+# --- Admin: machine templates ----------------------------------------------
+
+
+@app.post("/api/admin/machine-templates", response_model=schemas.MachineTemplateOut)
+def create_machine_template(
+    payload: schemas.MachineTemplateCreate,
+    db: Session = Depends(get_db),
+    _admin: models.User = Depends(auth.require_admin),
+):
+    if not db.get(models.AssetClass, payload.asset_class_id):
+        raise HTTPException(status_code=404, detail="Unknown asset_class_id.")
+
+    field_keys = {f.key for f in payload.fields}
+    if payload.identifier_field_key not in field_keys:
+        raise HTTPException(
+            status_code=400, detail="identifier_field_key must be one of the template's fields."
+        )
+
+    template = models.MachineTemplate(
+        asset_class_id=payload.asset_class_id,
+        name=payload.name,
+        manufacturer=payload.manufacturer,
+        capture_methods=payload.capture_methods,
+        identifier_field_key=payload.identifier_field_key,
+        fields=[f.model_dump() for f in payload.fields],
+        prompt_instructions=payload.prompt_instructions,
+        quirks=payload.quirks,
+    )
+    db.add(template)
+    db.commit()
+    db.refresh(template)
+    return template
+
+
+@app.get("/api/admin/machine-templates", response_model=list[schemas.MachineTemplateOut])
+def list_machine_templates_admin(
+    db: Session = Depends(get_db), _admin: models.User = Depends(auth.require_admin)
+):
+    return db.query(models.MachineTemplate).all()
+
+
+# --- Admin: machines (assign to any client) -------------------------------
+
+
+def _create_machine(db: Session, client_id: int, payload: schemas.MachineCreate) -> models.Machine:
+    template = db.get(models.MachineTemplate, payload.template_id)
+    if not template:
+        raise HTTPException(status_code=404, detail="Unknown template_id.")
+    if not db.get(models.Client, client_id):
+        raise HTTPException(status_code=404, detail="Unknown client_id.")
+
+    machine = models.Machine(
+        client_id=client_id,
+        template_id=payload.template_id,
+        name=payload.name,
+        identifier_value=payload.identifier_value,
+    )
+    db.add(machine)
+    db.commit()
+    db.refresh(machine)
+    return machine
+
+
+@app.post("/api/admin/machines", response_model=schemas.MachineOut)
+def create_machine_admin(
+    payload: schemas.MachineCreate,
+    db: Session = Depends(get_db),
+    _admin: models.User = Depends(auth.require_admin),
+):
+    if payload.client_id is None:
+        raise HTTPException(status_code=400, detail="client_id is required.")
+    return _create_machine(db, client_id=payload.client_id, payload=payload)
+
+
+@app.get("/api/admin/machines", response_model=list[schemas.MachineOut])
+def list_machines_admin(
+    client_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+    _admin: models.User = Depends(auth.require_admin),
+):
+    query = db.query(models.Machine)
+    if client_id is not None:
+        query = query.filter(models.Machine.client_id == client_id)
+    return query.all()
+
+
+# --- Client: asset classes + templates (read-only, for building forms) ---
+
+
+@app.get("/api/asset-classes", response_model=list[schemas.AssetClassOut])
+def list_asset_classes(
+    db: Session = Depends(get_db), _client: models.User = Depends(auth.require_client)
+):
+    return db.query(models.AssetClass).all()
+
+
+@app.get("/api/machine-templates", response_model=list[schemas.MachineTemplateOut])
+def list_machine_templates(
+    asset_class_id: str | None = Query(None),
+    db: Session = Depends(get_db),
+    _client: models.User = Depends(auth.require_client),
+):
+    query = db.query(models.MachineTemplate)
+    if asset_class_id:
+        query = query.filter(models.MachineTemplate.asset_class_id == asset_class_id)
+    return query.all()
+
+
+# --- Client: machines (own only) ------------------------------------------
+
+
+@app.get("/api/machines", response_model=list[schemas.MachineOut])
+def list_my_machines(
+    db: Session = Depends(get_db), client: models.User = Depends(auth.require_client)
+):
+    return db.query(models.Machine).filter(models.Machine.client_id == client.client_id).all()
+
+
+@app.post("/api/machines", response_model=schemas.MachineOut)
+def create_my_machine(
+    payload: schemas.MachineCreate,
+    db: Session = Depends(get_db),
+    client: models.User = Depends(auth.require_client),
+):
+    return _create_machine(db, client_id=client.client_id, payload=payload)
+
+
+# --- Client: scan (OCR + auto-detect + template-driven extraction) -------
+
+
+@app.post("/api/scan")
+async def scan(
+    file: UploadFile = File(...),
+    asset_class_id: str | None = Query(None),
+    machine_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+    client: models.User = Depends(auth.require_client),
+):
+    """Upload a scan for auto-detection (or pass `machine_id` to skip it).
+
+    Returns `{"status": "matched", "machine": ..., "fields": ..., ...}` when a
+    single machine was resolved, or `{"status": "ambiguous"|"no_match",
+    "candidates": [...], "raw_text": ...}` when the caller should re-submit the
+    same image with an explicit `machine_id` from those candidates.
     """
     filename = file.filename or "upload"
     extension = os.path.splitext(filename)[1].lower()
     content_type = (file.content_type or "").split(";")[0].strip().lower()
 
-    # Some browsers send application/octet-stream for camera captures, so fall
-    # back to the extension before rejecting.
     if content_type not in ALLOWED_MIME_TYPES:
         if extension not in ALLOWED_EXTENSIONS:
             return _error(
@@ -110,7 +318,6 @@ async def extract(file: UploadFile = File(...), include_raw_text: bool = False):
                 "Please upload a JPG, PNG, WEBP or PDF.",
             )
         content_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
-
     if content_type == "image/jpg":
         content_type = "image/jpeg"
 
@@ -119,29 +326,19 @@ async def extract(file: UploadFile = File(...), include_raw_text: bool = False):
 
     if not file_bytes:
         return _error(400, "The uploaded file is empty.")
-
     if len(file_bytes) > MAX_UPLOAD_BYTES:
         actual_mb = len(file_bytes) / (1024 * 1024)
         return _error(
-            413,
-            f"File is {actual_mb:.1f}MB, which exceeds the {MAX_UPLOAD_MB}MB limit. "
-            "Try a smaller photo or a compressed PDF.",
+            413, f"File is {actual_mb:.1f}MB, which exceeds the {MAX_UPLOAD_MB}MB limit."
         )
 
-    if _is_mock_mode():
-        logger.info("MOCK_MODE is on - returning mock data for %s", filename)
-        return MOCK_RESPONSE
-
-    # 1. Normalize to image bytes (rasterizing PDFs in memory).
     try:
         images = prepare_images(file_bytes, content_type)
     except OcrError as exc:
         return _error(400, str(exc))
-
     if not images:
         return _error(400, "Could not read any pages or images from that file.")
 
-    # 2. OCR.
     try:
         ocr_text = await run_ocr(images)
     except OcrError as exc:
@@ -151,27 +348,116 @@ async def extract(file: UploadFile = File(...), include_raw_text: bool = False):
     if not ocr_text.strip():
         return _error(
             422,
-            "No readable text was found in that file. Try a sharper, well-lit photo of the bill.",
+            "No readable text was found in that file. Try a sharper, well-lit photo.",
             raw_text="",
         )
 
-    # 3. Structured field extraction.
+    if machine_id is not None:
+        machine = (
+            db.query(models.Machine)
+            .filter(models.Machine.id == machine_id, models.Machine.client_id == client.client_id)
+            .first()
+        )
+        if not machine:
+            return _error(404, "Unknown machine_id for this client.")
+    else:
+        candidates_query = db.query(models.Machine).filter(
+            models.Machine.client_id == client.client_id
+        )
+        if asset_class_id:
+            candidates_query = candidates_query.join(models.MachineTemplate).filter(
+                models.MachineTemplate.asset_class_id == asset_class_id
+            )
+        candidates = candidates_query.all()
+        matches = find_matching_machines(candidates, ocr_text)
+
+        if len(matches) != 1:
+            return {
+                "status": "ambiguous" if len(matches) > 1 else "no_match",
+                "candidates": [
+                    schemas.MachineOut.model_validate(m).model_dump(mode="json")
+                    for m in (matches or candidates)
+                ],
+                "raw_text": ocr_text,
+            }
+        machine = matches[0]
+
+    template = machine.template
     try:
-        result = await parse_bill(ocr_text)
-        if include_raw_text:
-            result["raw_text"] = ocr_text
-        return result
+        extracted = await parse_document(
+            ocr_text,
+            fields=template.fields,
+            prompt_instructions=template.prompt_instructions,
+            quirks=template.quirks,
+        )
     except LlmParseError as exc:
         logger.error("LLM parse failed for %s: %s", filename, exc)
         return _error(
             422,
-            "We read the bill but could not structure the fields automatically. "
-            "You can enter them manually below.",
+            "We read the document but could not structure the fields automatically.",
             raw_text=ocr_text,
         )
     except LlmError as exc:
         logger.error("LLM call failed for %s: %s", filename, exc)
         return _error(502, f"Field extraction failed. {exc}", raw_text=ocr_text)
+
+    confidence_flags = extracted.pop("confidence_flags", {})
+    return {
+        "status": "matched",
+        "machine": schemas.MachineOut.model_validate(machine).model_dump(mode="json"),
+        "fields": extracted,
+        "confidence_flags": confidence_flags,
+        "raw_text": ocr_text,
+    }
+
+
+# --- Client: readings -------------------------------------------------------
+
+
+@app.post("/api/readings", response_model=schemas.ReadingOut)
+def create_reading(
+    payload: schemas.ReadingCreate,
+    db: Session = Depends(get_db),
+    client: models.User = Depends(auth.require_client),
+):
+    machine = (
+        db.query(models.Machine)
+        .filter(
+            models.Machine.id == payload.machine_id, models.Machine.client_id == client.client_id
+        )
+        .first()
+    )
+    if not machine:
+        raise HTTPException(status_code=404, detail="Unknown machine_id for this client.")
+
+    reading = models.Reading(
+        machine_id=payload.machine_id,
+        captured_by_user_id=client.id,
+        capture_method=payload.capture_method,
+        fields=payload.fields,
+        confidence_flags=payload.confidence_flags,
+        raw_text=payload.raw_text,
+    )
+    db.add(reading)
+    db.commit()
+    db.refresh(reading)
+    return reading
+
+
+@app.get("/api/readings", response_model=list[schemas.ReadingOut])
+def list_my_readings(
+    machine_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+    client: models.User = Depends(auth.require_client),
+):
+    query = (
+        db.query(models.Reading)
+        .join(models.Machine)
+        .filter(models.Machine.client_id == client.client_id)
+    )
+    if machine_id is not None:
+        query = query.filter(models.Reading.machine_id == machine_id)
+    return query.order_by(models.Reading.captured_at.desc()).all()
 
 
 if __name__ == "__main__":

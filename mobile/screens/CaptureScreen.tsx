@@ -13,6 +13,7 @@ import {
   View,
 } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
+import SafeButton from "../components/SafeButton";
 import { MAX_FILE_BYTES, type PickedFile } from "../lib/api";
 import { colors, radius, spacing } from "../lib/theme";
 
@@ -77,37 +78,51 @@ export default function CaptureScreen({ onSubmit }: CaptureScreenProps) {
   };
 
   const pickFromLibrary = async () => {
-    const result = await ImagePicker.launchImageLibraryAsync({
-      mediaTypes: ["images"],
-      quality: 0.9,
-    });
-    if (result.canceled || !result.assets?.length) return;
+    try {
+      const result = await ImagePicker.launchImageLibraryAsync({
+        mediaTypes: ["images"],
+        quality: 0.9,
+      });
+      if (result.canceled || !result.assets?.length) return;
 
-    const asset = result.assets[0];
-    if (tooLarge(asset.fileSize)) return;
+      const asset = result.assets[0];
+      if (tooLarge(asset.fileSize)) return;
 
-    setCaptured({
-      uri: asset.uri,
-      name: asset.fileName ?? fileNameFrom(asset.uri, "bill.jpg"),
-      mimeType: guessMimeType(asset.uri, asset.mimeType),
-    });
+      setCaptured({
+        uri: asset.uri,
+        name: asset.fileName ?? fileNameFrom(asset.uri, "bill.jpg"),
+        mimeType: guessMimeType(asset.uri, asset.mimeType),
+      });
+    } catch (error) {
+      Alert.alert(
+        "Couldn't open photos",
+        error instanceof Error ? error.message : "The photo library could not be opened."
+      );
+    }
   };
 
   const pickDocument = async () => {
-    const result = await DocumentPicker.getDocumentAsync({
-      type: ["application/pdf", "image/*"],
-      copyToCacheDirectory: true,
-    });
-    if (result.canceled || !result.assets?.length) return;
+    try {
+      const result = await DocumentPicker.getDocumentAsync({
+        type: ["application/pdf", "image/*"],
+        copyToCacheDirectory: true,
+      });
+      if (result.canceled || !result.assets?.length) return;
 
-    const asset = result.assets[0];
-    if (tooLarge(asset.size ?? undefined)) return;
+      const asset = result.assets[0];
+      if (tooLarge(asset.size ?? undefined)) return;
 
-    setCaptured({
-      uri: asset.uri,
-      name: asset.name ?? fileNameFrom(asset.uri, "bill.pdf"),
-      mimeType: guessMimeType(asset.name ?? asset.uri, asset.mimeType),
-    });
+      setCaptured({
+        uri: asset.uri,
+        name: asset.name ?? fileNameFrom(asset.uri, "bill.pdf"),
+        mimeType: guessMimeType(asset.name ?? asset.uri, asset.mimeType),
+      });
+    } catch (error) {
+      Alert.alert(
+        "Couldn't open files",
+        error instanceof Error ? error.message : "The file picker could not be opened."
+      );
+    }
   };
 
   // --- Permission gates -----------------------------------------------------
@@ -134,21 +149,21 @@ export default function CaptureScreen({ onSubmit }: CaptureScreenProps) {
               : "Bill Extractor uses the camera to photograph your electricity bill. Nothing is stored on the device."}
           </Text>
 
-          <Pressable
+          <SafeButton
             style={styles.primaryButton}
             onPress={() => (blockedForGood ? Linking.openSettings() : requestPermission())}
           >
             <Text style={styles.primaryButtonText}>
               {blockedForGood ? "Open Settings" : "Allow Camera"}
             </Text>
-          </Pressable>
+          </SafeButton>
 
-          <Pressable style={styles.secondaryButton} onPress={pickDocument}>
+          <SafeButton style={styles.secondaryButton} onPress={pickDocument}>
             <Text style={styles.secondaryButtonText}>Choose a file instead</Text>
-          </Pressable>
-          <Pressable style={styles.secondaryButton} onPress={pickFromLibrary}>
+          </SafeButton>
+          <SafeButton style={styles.secondaryButton} onPress={pickFromLibrary}>
             <Text style={styles.secondaryButtonText}>Pick from photos</Text>
-          </Pressable>
+          </SafeButton>
         </View>
       </SafeAreaView>
     );
@@ -180,12 +195,12 @@ export default function CaptureScreen({ onSubmit }: CaptureScreenProps) {
         </View>
 
         <View style={styles.reviewActions}>
-          <Pressable style={styles.secondaryButton} onPress={() => setCaptured(null)}>
+          <SafeButton style={styles.secondaryButton} onPress={() => setCaptured(null)}>
             <Text style={styles.secondaryButtonText}>Retake</Text>
-          </Pressable>
-          <Pressable style={styles.primaryButton} onPress={() => onSubmit(captured)}>
+          </SafeButton>
+          <SafeButton style={styles.primaryButton} onPress={() => onSubmit(captured)}>
             <Text style={styles.primaryButtonText}>Extract Details</Text>
-          </Pressable>
+          </SafeButton>
         </View>
       </SafeAreaView>
     );
@@ -213,13 +228,13 @@ export default function CaptureScreen({ onSubmit }: CaptureScreenProps) {
         <View style={styles.frameGuide} pointerEvents="none" />
 
         <View style={styles.cameraControls}>
-          <Pressable
+          <SafeButton
             style={styles.roundButton}
             onPress={pickFromLibrary}
             accessibilityLabel="Pick a bill from your photos"
           >
             <Text style={styles.roundButtonText}>Photos</Text>
-          </Pressable>
+          </SafeButton>
 
           <Pressable
             onPress={takePhoto}
@@ -232,13 +247,13 @@ export default function CaptureScreen({ onSubmit }: CaptureScreenProps) {
             </View>
           </Pressable>
 
-          <Pressable
+          <SafeButton
             style={styles.roundButton}
             onPress={pickDocument}
             accessibilityLabel="Pick a PDF or image file"
           >
             <Text style={styles.roundButtonText}>File</Text>
-          </Pressable>
+          </SafeButton>
         </View>
       </SafeAreaView>
     </View>
@@ -416,7 +431,7 @@ const styles = StyleSheet.create({
     alignItems: "center",
   },
   secondaryButtonText: {
-    color: colors.slate300,
+    color: colors.slate500,
     fontSize: 15,
     fontWeight: "600",
   },

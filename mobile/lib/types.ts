@@ -5,6 +5,7 @@ export interface BillFields {
   rr_number: string | null;
   address: string | null;
   account_number: string | null;
+  mr_code: string | null;
   units_consumed: string | null;
   amount_to_pay: string | null;
   tariff: string | null;
@@ -31,6 +32,7 @@ export const FIELD_META: FieldMeta[] = [
   { key: "rr_number", label: "RR Number", placeholder: "RR number from the bill" },
   { key: "address", label: "Address", placeholder: "Service address", multiline: true },
   { key: "account_number", label: "Account Number", placeholder: "Account / consumer number" },
+  { key: "mr_code", label: "M.R Code", placeholder: "Meter reading route code" },
   {
     key: "units_consumed",
     label: "Units Consumed",
@@ -52,6 +54,7 @@ export const EMPTY_RESULT: ExtractionResult = {
   rr_number: null,
   address: null,
   account_number: null,
+  mr_code: null,
   units_consumed: null,
   amount_to_pay: null,
   tariff: null,
