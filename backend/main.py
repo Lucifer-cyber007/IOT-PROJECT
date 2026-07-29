@@ -36,10 +36,19 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
-# Cap on files per batch request, and how many we OCR/parse at once. The
-# concurrency limit keeps us clear of Vision/Groq rate limits on large batches.
+# Cap on files per batch request, and how many we OCR/parse at once.
+#
+# BATCH_CONCURRENCY defaults low deliberately: Groq's free tier caps at 12,000
+# tokens/minute and a single bill extraction uses ~2,000-2,200 of them, so 4
+# concurrent requests can exhaust the whole per-minute budget in one burst
+# before any of them lands. 2 leaves headroom; raise it if you're on a paid
+# Groq tier with more TPM.
 MAX_BATCH_FILES = int(os.getenv("MAX_BATCH_FILES", "25"))
-BATCH_CONCURRENCY = int(os.getenv("BATCH_CONCURRENCY", "4"))
+BATCH_CONCURRENCY = int(os.getenv("BATCH_CONCURRENCY", "2"))
+# Extra spacing between a batch's requests starting, on top of the concurrency
+# cap above - smooths out the burst further so a wave of N requests doesn't
+# all land on Groq in the same instant.
+BATCH_STAGGER_SECONDS = float(os.getenv("BATCH_STAGGER_SECONDS", "0.4"))
 
 MOCK_RESPONSE = {
     "name": "RAMESH KUMAR S",
@@ -238,6 +247,10 @@ async def extract_batch(
     semaphore = asyncio.Semaphore(max(1, BATCH_CONCURRENCY))
 
     async def process(index: int, filename: str, content_type: str | None, data: bytes) -> dict:
+        # Stagger task starts so a large batch doesn't fire in simultaneous
+        # waves of BATCH_CONCURRENCY requests - see BATCH_STAGGER_SECONDS above.
+        await asyncio.sleep(index * BATCH_STAGGER_SECONDS)
+
         async with semaphore:
             try:
                 status, payload = await _run_pipeline(

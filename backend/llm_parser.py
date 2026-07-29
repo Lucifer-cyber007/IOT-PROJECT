@@ -19,6 +19,30 @@ DEFAULT_MODEL = "llama-3.3-70b-versatile"
 # Transient conditions worth another attempt rather than failing the extraction.
 RETRYABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
 BACKOFF_BASE_SECONDS = 0.6
+# Groq's 429 body names the exact wait, e.g. "Please try again in 2.6s" or "170ms".
+# Respecting that (instead of a short fixed backoff) is what actually clears a
+# token-per-minute limit; a fixed 1-2s backoff just re-hits the same window.
+RETRY_AFTER_RE = re.compile(r"try again in (\d+(?:\.\d+)?)(ms|s)\b", re.IGNORECASE)
+MAX_RETRY_AFTER_SECONDS = 20.0
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Extract Groq's suggested wait time from a 429, in seconds."""
+    header = response.headers.get("retry-after")
+    if header:
+        try:
+            return min(float(header), MAX_RETRY_AFTER_SECONDS)
+        except ValueError:
+            pass
+
+    match = RETRY_AFTER_RE.search(response.text)
+    if match:
+        value = float(match.group(1))
+        if match.group(2).lower() == "ms":
+            value /= 1000
+        return min(value, MAX_RETRY_AFTER_SECONDS)
+
+    return None
 
 FIELDS = (
     "name",
@@ -419,12 +443,17 @@ async def _call_groq(
     model: str,
     system_prompt: str,
     ocr_text: str,
-    max_attempts: int = 3,
+    max_attempts: int = 5,
 ) -> str:
-    """Call Groq, retrying transient failures with exponential backoff.
+    """Call Groq, retrying transient failures.
 
-    Batch uploads run several extractions at once, which makes 429s and momentary
-    5xx responses considerably more likely than in the single-bill path.
+    Batch uploads run several extractions at once, which makes it easy to trip
+    Groq's tokens-per-minute limit even though each individual call is well
+    within it. On a 429, Groq's response body states exactly how long the
+    caller must wait for the window to clear (e.g. "try again in 2.6s") - that
+    is honored here rather than guessed at with a short fixed backoff, which
+    would just retry into the same exhausted window and burn all attempts
+    before the quota actually recovers.
     """
     request = {
         "model": model,
@@ -442,6 +471,8 @@ async def _call_groq(
     last_error = "Groq could not be reached."
 
     for attempt in range(1, max_attempts + 1):
+        retry_after: float | None = None
+
         try:
             response = await client.post(
                 GROQ_ENDPOINT,
@@ -461,11 +492,17 @@ async def _call_groq(
             last_error = f"Groq API returned HTTP {response.status_code}: {response.text[:400]}"
             if response.status_code not in RETRYABLE_HTTP_STATUSES:
                 raise LlmError(last_error)
+            if response.status_code == 429:
+                retry_after = _retry_after_seconds(response)
 
         if attempt == max_attempts:
             break
 
-        delay = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.4)
+        if retry_after is not None:
+            delay = retry_after + random.uniform(0.05, 0.3)
+        else:
+            delay = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.4)
+
         logger.warning(
             "Groq attempt %d/%d failed (%s); retrying in %.1fs",
             attempt,

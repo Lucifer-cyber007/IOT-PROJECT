@@ -127,12 +127,15 @@ field comes out wrong and you want to see what the OCR actually produced.
 | 422 | OCR worked but the fields could not be structured — body includes `raw_text` and the UI falls back to manual entry |
 | 502 | Vision or Groq call failed |
 
-Transient Vision/Groq failures (429s, 5xx, `UNAVAILABLE`) are retried up to 3 times with
-exponential backoff before the request is failed.
+Transient Vision failures (429s, 5xx, `UNAVAILABLE`) are retried up to 3 times with exponential
+backoff. Groq 429s are retried up to 5 times honoring the wait time Groq's own error message
+states (e.g. "try again in 2.6s") rather than a fixed backoff — a short fixed delay just retries
+into the same exhausted per-minute token window and burns attempts for nothing.
 
 ### `POST /api/extract-batch`
 
-`multipart/form-data` with repeated `files` fields — up to 25 bills, processed 4 at a time.
+`multipart/form-data` with repeated `files` fields — up to 25 bills, processed 2 at a time by
+default.
 
 Always responds **200** with a per-file result, so one bad photo never discards the rest of
 the batch:
@@ -149,7 +152,10 @@ the batch:
 }
 ```
 
-Tune with `MAX_BATCH_FILES` and `BATCH_CONCURRENCY` in `.env`.
+Tune with `MAX_BATCH_FILES`, `BATCH_CONCURRENCY` and `BATCH_STAGGER_SECONDS` in `.env`.
+`BATCH_CONCURRENCY` defaults to 2 because Groq's free tier caps at 12,000 tokens/minute and one
+bill extraction uses roughly 2,000-2,200 of them — 4 concurrent requests can exhaust the whole
+budget in a single burst before any of them lands. Raise it if you're on a paid Groq tier.
 
 ### `POST /api/export/xlsx`
 
