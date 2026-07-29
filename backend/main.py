@@ -5,6 +5,7 @@ Flow: upload -> (PDF rasterize) -> Google Cloud Vision OCR -> Groq field extract
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -13,7 +14,8 @@ from fastapi import FastAPI, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 
-from llm_parser import LlmError, LlmParseError, parse_bill
+from excel_export import build_workbook
+from llm_parser import FIELDS, LlmError, LlmParseError, parse_bill
 from vision_ocr import OcrError, prepare_images, run_ocr
 
 load_dotenv()
@@ -33,6 +35,11 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+
+# Cap on files per batch request, and how many we OCR/parse at once. The
+# concurrency limit keeps us clear of Vision/Groq rate limits on large batches.
+MAX_BATCH_FILES = int(os.getenv("MAX_BATCH_FILES", "25"))
+BATCH_CONCURRENCY = int(os.getenv("BATCH_CONCURRENCY", "4"))
 
 MOCK_RESPONSE = {
     "name": "RAMESH KUMAR S",
@@ -55,7 +62,7 @@ def _allowed_origins() -> list[str]:
 app = FastAPI(
     title="Electricity Bill Extractor API",
     description="Extracts structured billing data from electricity bill images and PDFs.",
-    version="1.0.0",
+    version="1.1.0",
 )
 
 app.add_middleware(
@@ -75,6 +82,102 @@ def _is_mock_mode() -> bool:
     return os.getenv("MOCK_MODE", "0").strip().lower() in {"1", "true", "yes"}
 
 
+def _normalize_content_type(filename: str, raw_content_type: str | None) -> str | None:
+    """Resolve an upload's mime type, falling back to its extension.
+
+    Returns None when the file type is not supported. Some browsers send
+    application/octet-stream for camera captures, hence the extension fallback.
+    """
+    extension = os.path.splitext(filename)[1].lower()
+    content_type = (raw_content_type or "").split(";")[0].strip().lower()
+
+    if content_type not in ALLOWED_MIME_TYPES:
+        if extension not in ALLOWED_EXTENSIONS:
+            return None
+        content_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
+
+    return "image/jpeg" if content_type == "image/jpg" else content_type
+
+
+async def _run_pipeline(
+    filename: str,
+    raw_content_type: str | None,
+    file_bytes: bytes,
+    include_raw_text: bool = False,
+) -> tuple[int, dict]:
+    """Run one upload through the full pipeline.
+
+    Returns an (http_status, payload) pair so both the single and batch endpoints
+    can share exactly the same validation and error wording.
+    """
+    content_type = _normalize_content_type(filename, raw_content_type)
+    if content_type is None:
+        given = (raw_content_type or os.path.splitext(filename)[1] or "unknown").strip()
+        return 415, {
+            "detail": f"Unsupported file type '{given}'. Please upload a JPG, PNG, WEBP or PDF."
+        }
+
+    if not file_bytes:
+        return 400, {"detail": "The uploaded file is empty."}
+
+    if len(file_bytes) > MAX_UPLOAD_BYTES:
+        actual_mb = len(file_bytes) / (1024 * 1024)
+        return 413, {
+            "detail": (
+                f"File is {actual_mb:.1f}MB, which exceeds the {MAX_UPLOAD_MB}MB limit. "
+                "Try a smaller photo or a compressed PDF."
+            )
+        }
+
+    if _is_mock_mode():
+        logger.info("MOCK_MODE is on - returning mock data for %s", filename)
+        return 200, dict(MOCK_RESPONSE)
+
+    # 1. Normalize to image bytes (rasterizing PDFs in memory).
+    try:
+        images = prepare_images(file_bytes, content_type)
+    except OcrError as exc:
+        return 400, {"detail": str(exc)}
+
+    if not images:
+        return 400, {"detail": "Could not read any pages or images from that file."}
+
+    # 2. OCR.
+    try:
+        ocr_text = await run_ocr(images)
+    except OcrError as exc:
+        logger.error("OCR failed for %s: %s", filename, exc)
+        return 502, {"detail": f"Text extraction failed. {exc}"}
+
+    if not ocr_text.strip():
+        return 422, {
+            "detail": (
+                "No readable text was found in that file. "
+                "Try a sharper, well-lit photo of the bill."
+            ),
+            "raw_text": "",
+        }
+
+    # 3. Structured field extraction.
+    try:
+        result = await parse_bill(ocr_text)
+        if include_raw_text:
+            result["raw_text"] = ocr_text
+        return 200, result
+    except LlmParseError as exc:
+        logger.error("LLM parse failed for %s: %s", filename, exc)
+        return 422, {
+            "detail": (
+                "We read the bill but could not structure the fields automatically. "
+                "You can enter them manually below."
+            ),
+            "raw_text": ocr_text,
+        }
+    except LlmError as exc:
+        logger.error("LLM call failed for %s: %s", filename, exc)
+        return 502, {"detail": f"Field extraction failed. {exc}", "raw_text": ocr_text}
+
+
 @app.get("/api/health")
 async def health() -> dict:
     """Cheap readiness probe that also reports which API keys are configured."""
@@ -84,6 +187,7 @@ async def health() -> dict:
         "vision_key_configured": bool(os.getenv("GOOGLE_CLOUD_VISION_API_KEY")),
         "groq_key_configured": bool(os.getenv("GROQ_API_KEY")),
         "max_upload_mb": MAX_UPLOAD_MB,
+        "max_batch_files": MAX_BATCH_FILES,
     }
 
 
@@ -97,81 +201,107 @@ async def extract(file: UploadFile = File(...), include_raw_text: bool = False):
     OCR actually produced.
     """
     filename = file.filename or "upload"
-    extension = os.path.splitext(filename)[1].lower()
-    content_type = (file.content_type or "").split(";")[0].strip().lower()
-
-    # Some browsers send application/octet-stream for camera captures, so fall
-    # back to the extension before rejecting.
-    if content_type not in ALLOWED_MIME_TYPES:
-        if extension not in ALLOWED_EXTENSIONS:
-            return _error(
-                415,
-                f"Unsupported file type '{content_type or extension or 'unknown'}'. "
-                "Please upload a JPG, PNG, WEBP or PDF.",
-            )
-        content_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
-
-    if content_type == "image/jpg":
-        content_type = "image/jpeg"
-
     file_bytes = await file.read()
     await file.close()
 
-    if not file_bytes:
-        return _error(400, "The uploaded file is empty.")
+    status, payload = await _run_pipeline(
+        filename, file.content_type, file_bytes, include_raw_text
+    )
+    if status == 200:
+        return payload
+    return JSONResponse(status_code=status, content=payload)
 
-    if len(file_bytes) > MAX_UPLOAD_BYTES:
-        actual_mb = len(file_bytes) / (1024 * 1024)
+
+@app.post("/api/extract-batch")
+async def extract_batch(
+    files: list[UploadFile] = File(...), include_raw_text: bool = False
+):
+    """Extract several bills in one request.
+
+    Always responds 200 with a per-file result, so one bad photo in a batch of
+    twenty never discards the nineteen that worked. Inspect each item's `status`.
+    """
+    if not files:
+        return _error(400, "No files were uploaded.")
+
+    if len(files) > MAX_BATCH_FILES:
         return _error(
             413,
-            f"File is {actual_mb:.1f}MB, which exceeds the {MAX_UPLOAD_MB}MB limit. "
-            "Try a smaller photo or a compressed PDF.",
+            f"{len(files)} files were sent, but the limit is {MAX_BATCH_FILES} per batch.",
         )
 
-    if _is_mock_mode():
-        logger.info("MOCK_MODE is on - returning mock data for %s", filename)
-        return MOCK_RESPONSE
+    uploads: list[tuple[str, str | None, bytes]] = []
+    for upload in files:
+        uploads.append((upload.filename or "upload", upload.content_type, await upload.read()))
+        await upload.close()
 
-    # 1. Normalize to image bytes (rasterizing PDFs in memory).
-    try:
-        images = prepare_images(file_bytes, content_type)
-    except OcrError as exc:
-        return _error(400, str(exc))
+    semaphore = asyncio.Semaphore(max(1, BATCH_CONCURRENCY))
 
-    if not images:
-        return _error(400, "Could not read any pages or images from that file.")
+    async def process(index: int, filename: str, content_type: str | None, data: bytes) -> dict:
+        async with semaphore:
+            try:
+                status, payload = await _run_pipeline(
+                    filename, content_type, data, include_raw_text
+                )
+            except Exception as exc:  # noqa: BLE001 - one file must not sink the batch
+                logger.exception("Unexpected failure processing %s", filename)
+                return {
+                    "index": index,
+                    "filename": filename,
+                    "status": "error",
+                    "error": f"Unexpected error: {exc}",
+                }
 
-    # 2. OCR.
-    try:
-        ocr_text = await run_ocr(images)
-    except OcrError as exc:
-        logger.error("OCR failed for %s: %s", filename, exc)
-        return _error(502, f"Text extraction failed. {exc}")
+        if status == 200:
+            return {"index": index, "filename": filename, "status": "ok", "data": payload}
 
-    if not ocr_text.strip():
-        return _error(
-            422,
-            "No readable text was found in that file. Try a sharper, well-lit photo of the bill.",
-            raw_text="",
-        )
+        return {
+            "index": index,
+            "filename": filename,
+            "status": "error",
+            "error": payload.get("detail", "Extraction failed."),
+            "raw_text": payload.get("raw_text", ""),
+        }
 
-    # 3. Structured field extraction.
-    try:
-        result = await parse_bill(ocr_text)
-        if include_raw_text:
-            result["raw_text"] = ocr_text
-        return result
-    except LlmParseError as exc:
-        logger.error("LLM parse failed for %s: %s", filename, exc)
-        return _error(
-            422,
-            "We read the bill but could not structure the fields automatically. "
-            "You can enter them manually below.",
-            raw_text=ocr_text,
-        )
-    except LlmError as exc:
-        logger.error("LLM call failed for %s: %s", filename, exc)
-        return _error(502, f"Field extraction failed. {exc}", raw_text=ocr_text)
+    results = await asyncio.gather(
+        *(process(i, name, ctype, data) for i, (name, ctype, data) in enumerate(uploads))
+    )
+    ordered = sorted(results, key=lambda item: item["index"])
+
+    return {
+        "results": ordered,
+        "succeeded": sum(1 for item in ordered if item["status"] == "ok"),
+        "failed": sum(1 for item in ordered if item["status"] == "error"),
+    }
+
+
+@app.post("/api/export/xlsx")
+async def export_xlsx(payload: dict):
+    """Build an .xlsx workbook from rows of (possibly user-edited) bill fields.
+
+    The frontend posts what is currently on screen rather than the original
+    extraction, so manual corrections make it into the spreadsheet.
+    """
+    rows = payload.get("rows")
+    if not isinstance(rows, list) or not rows:
+        return _error(400, "Provide a non-empty 'rows' array to export.")
+
+    cleaned: list[dict] = []
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        entry = {field: row.get(field) for field in FIELDS}
+        entry["source_file"] = row.get("source_file")
+        cleaned.append(entry)
+
+    if not cleaned:
+        return _error(400, "None of the supplied rows were valid objects.")
+
+    filename = str(payload.get("filename") or "electricity-bills.xlsx")
+    if not filename.lower().endswith(".xlsx"):
+        filename += ".xlsx"
+
+    return build_workbook(cleaned, filename)
 
 
 if __name__ == "__main__":

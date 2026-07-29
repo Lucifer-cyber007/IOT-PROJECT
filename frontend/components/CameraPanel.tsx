@@ -41,11 +41,19 @@ function describeCameraError(error: string | DOMException): string {
 }
 
 interface CameraPanelProps {
-  onSubmit: (file: File) => void;
+  /** Number of bills already queued, from either tab. */
+  queueCount: number;
+  onCapture: (file: File) => void;
+  onSubmit: () => void;
   onSwitchToUpload: () => void;
 }
 
-export default function CameraPanel({ onSubmit, onSwitchToUpload }: CameraPanelProps) {
+export default function CameraPanel({
+  queueCount,
+  onCapture,
+  onSubmit,
+  onSwitchToUpload,
+}: CameraPanelProps) {
   const webcamRef = useRef<Webcam>(null);
   const [capturedImage, setCapturedImage] = useState<string | null>(null);
   const [cameraError, setCameraError] = useState<string | null>(null);
@@ -60,9 +68,10 @@ export default function CameraPanel({ onSubmit, onSwitchToUpload }: CameraPanelP
     setCapturedImage(screenshot);
   }, []);
 
-  const usePhoto = () => {
+  const keepPhoto = () => {
     if (!capturedImage) return;
-    onSubmit(dataUrlToFile(capturedImage, "camera-capture.jpg"));
+    onCapture(dataUrlToFile(capturedImage, `bill-capture-${queueCount + 1}.jpg`));
+    setCapturedImage(null);
   };
 
   if (cameraError) {
@@ -111,7 +120,7 @@ export default function CameraPanel({ onSubmit, onSwitchToUpload }: CameraPanelP
             onClick={onSwitchToUpload}
             className="w-full rounded-lg bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-slate-800"
           >
-            Upload a file instead
+            Upload files instead
           </button>
         </div>
       </div>
@@ -123,11 +132,7 @@ export default function CameraPanel({ onSubmit, onSwitchToUpload }: CameraPanelP
       <div className="relative overflow-hidden rounded-xl border border-slate-200 bg-slate-900">
         {capturedImage ? (
           // eslint-disable-next-line @next/next/no-img-element
-          <img
-            src={capturedImage}
-            alt="Captured bill"
-            className="block w-full"
-          />
+          <img src={capturedImage} alt="Captured bill" className="block w-full" />
         ) : (
           <>
             <Webcam
@@ -151,6 +156,11 @@ export default function CameraPanel({ onSubmit, onSwitchToUpload }: CameraPanelP
                 className="pointer-events-none absolute inset-4 rounded-lg border-2 border-dashed border-white/40"
               />
             )}
+            {queueCount > 0 && (
+              <span className="absolute right-3 top-3 rounded-full bg-slate-900/80 px-3 py-1 text-xs font-semibold text-white">
+                {queueCount} captured
+              </span>
+            )}
           </>
         )}
       </div>
@@ -166,7 +176,7 @@ export default function CameraPanel({ onSubmit, onSwitchToUpload }: CameraPanelP
           </button>
           <button
             type="button"
-            onClick={usePhoto}
+            onClick={keepPhoto}
             className="w-full rounded-lg bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-slate-800"
           >
             Use This Photo
@@ -178,7 +188,7 @@ export default function CameraPanel({ onSubmit, onSwitchToUpload }: CameraPanelP
             type="button"
             onClick={capture}
             disabled={!isReady}
-            className="flex w-full items-center justify-center gap-2 rounded-lg bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
+            className="flex w-full items-center justify-center gap-2 rounded-lg border border-slate-300 bg-white px-4 py-3 text-sm font-semibold text-slate-800 transition-colors hover:bg-slate-50 disabled:cursor-not-allowed disabled:bg-slate-100 disabled:text-slate-400"
           >
             <svg
               className="h-5 w-5"
@@ -199,10 +209,20 @@ export default function CameraPanel({ onSubmit, onSwitchToUpload }: CameraPanelP
                 d="M16.5 12.75a4.5 4.5 0 11-9 0 4.5 4.5 0 019 0z"
               />
             </svg>
-            Capture Photo
+            {queueCount > 0 ? "Capture Another Bill" : "Capture Photo"}
           </button>
+
+          <button
+            type="button"
+            disabled={queueCount === 0}
+            onClick={onSubmit}
+            className="w-full rounded-lg bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
+          >
+            {queueCount > 1 ? `Extract ${queueCount} Bills` : "Extract Details"}
+          </button>
+
           <p className="text-center text-xs text-slate-500">
-            Fill the frame with the bill and keep it flat and well lit.
+            Photograph each bill in turn — they all get extracted together.
           </p>
         </>
       )}

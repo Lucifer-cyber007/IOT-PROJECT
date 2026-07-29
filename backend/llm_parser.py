@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import random
 import re
 
 import httpx
@@ -13,6 +15,10 @@ logger = logging.getLogger(__name__)
 
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
+
+# Transient conditions worth another attempt rather than failing the extraction.
+RETRYABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+BACKOFF_BASE_SECONDS = 0.6
 
 FIELDS = (
     "name",
@@ -408,33 +414,68 @@ def validate_and_normalize(payload: dict, ocr_text: str = "") -> dict:
 
 
 async def _call_groq(
-    client: httpx.AsyncClient, api_key: str, model: str, system_prompt: str, ocr_text: str
+    client: httpx.AsyncClient,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    ocr_text: str,
+    max_attempts: int = 3,
 ) -> str:
-    response = await client.post(
-        GROQ_ENDPOINT,
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": model,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {
-                    "role": "user",
-                    "content": f"Raw OCR text of the electricity bill:\n\n{ocr_text}",
-                },
-            ],
-        },
-    )
+    """Call Groq, retrying transient failures with exponential backoff.
 
-    if response.status_code != 200:
-        raise LlmError(f"Groq API returned HTTP {response.status_code}: {response.text[:500]}")
+    Batch uploads run several extractions at once, which makes 429s and momentary
+    5xx responses considerably more likely than in the single-bill path.
+    """
+    request = {
+        "model": model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {
+                "role": "user",
+                "content": f"Raw OCR text of the electricity bill:\n\n{ocr_text}",
+            },
+        ],
+    }
 
-    body = response.json()
-    try:
-        return body["choices"][0]["message"]["content"] or ""
-    except (KeyError, IndexError, TypeError) as exc:
-        raise LlmError(f"Unexpected Groq response shape: {body}") from exc
+    last_error = "Groq could not be reached."
+
+    for attempt in range(1, max_attempts + 1):
+        try:
+            response = await client.post(
+                GROQ_ENDPOINT,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=request,
+            )
+        except httpx.HTTPError as exc:
+            last_error = f"Could not reach Groq: {exc}"
+        else:
+            if response.status_code == 200:
+                body = response.json()
+                try:
+                    return body["choices"][0]["message"]["content"] or ""
+                except (KeyError, IndexError, TypeError) as exc:
+                    raise LlmError(f"Unexpected Groq response shape: {body}") from exc
+
+            last_error = f"Groq API returned HTTP {response.status_code}: {response.text[:400]}"
+            if response.status_code not in RETRYABLE_HTTP_STATUSES:
+                raise LlmError(last_error)
+
+        if attempt == max_attempts:
+            break
+
+        delay = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.4)
+        logger.warning(
+            "Groq attempt %d/%d failed (%s); retrying in %.1fs",
+            attempt,
+            max_attempts,
+            last_error,
+            delay,
+        )
+        await asyncio.sleep(delay)
+
+    raise LlmError(f"{last_error} (after {max_attempts} attempts)")
 
 
 async def parse_bill(ocr_text: str, api_key: str | None = None, model: str | None = None) -> dict:

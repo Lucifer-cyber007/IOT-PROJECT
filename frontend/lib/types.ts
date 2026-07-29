@@ -37,6 +37,17 @@ export const FIELD_META: FieldMeta[] = [
   { key: "bill_date", label: "Bill Date", placeholder: "DD-MM-YYYY" },
 ];
 
+/** One uploaded bill and whatever came back for it. */
+export interface BillEntry {
+  id: string;
+  fileName: string;
+  status: "ok" | "error";
+  data: ExtractionResult;
+  /** Present when status is "error", or when the fields could not be structured. */
+  error?: string;
+  rawText?: string;
+}
+
 export const EMPTY_RESULT: ExtractionResult = {
   name: null,
   rr_number: null,

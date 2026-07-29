@@ -115,6 +115,9 @@ eas build -p android --profile preview
 `multipart/form-data` with a single `file` field. Accepts JPG, PNG, WEBP and PDF up to 10 MB.
 For PDFs, pages 1 and 2 are rasterized and OCR'd together.
 
+Add `?include_raw_text=1` to get the raw OCR text back alongside the fields — useful when a
+field comes out wrong and you want to see what the OCR actually produced.
+
 | Status | Meaning |
 | ------ | ------- |
 | 200 | Extraction succeeded |
@@ -123,6 +126,39 @@ For PDFs, pages 1 and 2 are rasterized and OCR'd together.
 | 415 | Unsupported file type |
 | 422 | OCR worked but the fields could not be structured — body includes `raw_text` and the UI falls back to manual entry |
 | 502 | Vision or Groq call failed |
+
+Transient Vision/Groq failures (429s, 5xx, `UNAVAILABLE`) are retried up to 3 times with
+exponential backoff before the request is failed.
+
+### `POST /api/extract-batch`
+
+`multipart/form-data` with repeated `files` fields — up to 25 bills, processed 4 at a time.
+
+Always responds **200** with a per-file result, so one bad photo never discards the rest of
+the batch:
+
+```json
+{
+  "succeeded": 2,
+  "failed": 1,
+  "results": [
+    { "index": 0, "filename": "bill1.jpg", "status": "ok", "data": { ... } },
+    { "index": 1, "filename": "notes.txt", "status": "error",
+      "error": "Unsupported file type 'text/plain'. ..." }
+  ]
+}
+```
+
+Tune with `MAX_BATCH_FILES` and `BATCH_CONCURRENCY` in `.env`.
+
+### `POST /api/export/xlsx`
+
+Takes `{ "rows": [...], "filename": "bills.xlsx" }` and returns a formatted `.xlsx` download —
+styled header, frozen top row, autofilter, and numeric columns stored as real numbers so Excel
+can sum and sort them.
+
+The frontend posts what is currently on screen rather than the original extraction, so any
+corrections the user typed in are what land in the spreadsheet.
 
 ### `GET /api/health`
 

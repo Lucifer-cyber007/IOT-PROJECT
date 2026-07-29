@@ -2,10 +2,10 @@
 
 import dynamic from "next/dynamic";
 import { useCallback, useRef, useState } from "react";
-import UploadPanel from "@/components/UploadPanel";
+import UploadPanel, { makeQueuedFile, type QueuedFile } from "@/components/UploadPanel";
 import ResultsView from "@/components/ResultsView";
-import { extractBill } from "@/lib/api";
-import { EMPTY_RESULT, type ExtractionResult } from "@/lib/types";
+import { extractBills } from "@/lib/api";
+import type { BillEntry } from "@/lib/types";
 
 // react-webcam touches getUserMedia, so keep it out of the server render.
 const CameraPanel = dynamic(() => import("@/components/CameraPanel"), {
@@ -20,35 +20,22 @@ const CameraPanel = dynamic(() => import("@/components/CameraPanel"), {
 type Stage = "input" | "processing" | "results" | "error";
 type InputTab = "upload" | "camera";
 
-interface Results {
-  data: ExtractionResult;
-  rawText?: string;
-  notice?: string;
-}
-
 export default function Home() {
   const [stage, setStage] = useState<Stage>("input");
   const [tab, setTab] = useState<InputTab>("upload");
-  const [results, setResults] = useState<Results | null>(null);
+  const [queue, setQueue] = useState<QueuedFile[]>([]);
+  const [entries, setEntries] = useState<BillEntry[]>([]);
   const [errorMessage, setErrorMessage] = useState<string>("");
-  const lastFileRef = useRef<File | null>(null);
+  const lastFilesRef = useRef<File[]>([]);
 
-  const runExtraction = useCallback(async (file: File) => {
-    lastFileRef.current = file;
+  const runExtraction = useCallback(async (files: File[]) => {
+    if (files.length === 0) return;
+    lastFilesRef.current = files;
     setStage("processing");
     setErrorMessage("");
 
     try {
-      const outcome = await extractBill(file);
-      if (outcome.kind === "success") {
-        setResults({ data: outcome.data });
-      } else {
-        setResults({
-          data: EMPTY_RESULT,
-          rawText: outcome.rawText,
-          notice: outcome.message,
-        });
-      }
+      setEntries(await extractBills(files));
       setStage("results");
     } catch (error) {
       setErrorMessage(
@@ -58,20 +45,32 @@ export default function Home() {
     }
   }, []);
 
+  const submitQueue = () => {
+    void runExtraction(queue.map((item) => item.file));
+  };
+
+  const releasePreviews = () => {
+    queue.forEach((item) => item.previewUrl && URL.revokeObjectURL(item.previewUrl));
+  };
+
   const startOver = () => {
-    lastFileRef.current = null;
-    setResults(null);
+    releasePreviews();
+    setQueue([]);
+    setEntries([]);
+    lastFilesRef.current = [];
     setErrorMessage("");
     setStage("input");
   };
 
   const retry = () => {
-    if (lastFileRef.current) {
-      void runExtraction(lastFileRef.current);
+    if (lastFilesRef.current.length) {
+      void runExtraction(lastFilesRef.current);
     } else {
       startOver();
     }
   };
+
+  const queueCount = queue.length;
 
   return (
     <main className="mx-auto min-h-screen w-full max-w-3xl px-4 py-8 sm:px-6 sm:py-12">
@@ -94,8 +93,8 @@ export default function Home() {
           Electricity Bill Extractor
         </h1>
         <p className="mx-auto mt-2 max-w-md text-sm text-slate-500">
-          Upload a bill or snap a photo of it, and get the billing details as structured
-          data you can copy or download.
+          Upload or photograph your bills — one or many — and export them all to a single
+          spreadsheet.
         </p>
       </header>
 
@@ -108,7 +107,7 @@ export default function Home() {
           >
             {(
               [
-                { id: "upload", label: "Upload File" },
+                { id: "upload", label: "Upload Files" },
                 { id: "camera", label: "Use Camera" },
               ] as const
             ).map((option) => (
@@ -130,9 +129,14 @@ export default function Home() {
           </div>
 
           {tab === "upload" ? (
-            <UploadPanel onSubmit={runExtraction} />
+            <UploadPanel queue={queue} onQueueChange={setQueue} onSubmit={submitQueue} />
           ) : (
-            <CameraPanel onSubmit={runExtraction} onSwitchToUpload={() => setTab("upload")} />
+            <CameraPanel
+              queueCount={queueCount}
+              onCapture={(file) => setQueue((previous) => [...previous, makeQueuedFile(file)])}
+              onSubmit={submitQueue}
+              onSwitchToUpload={() => setTab("upload")}
+            />
           )}
         </section>
       )}
@@ -159,7 +163,11 @@ export default function Home() {
               d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z"
             />
           </svg>
-          <p className="mt-4 text-sm font-medium text-slate-900">Reading your bill…</p>
+          <p className="mt-4 text-sm font-medium text-slate-900">
+            {lastFilesRef.current.length > 1
+              ? `Reading ${lastFilesRef.current.length} bills…`
+              : "Reading your bill…"}
+          </p>
           <p className="mt-1 text-xs text-slate-500">
             Scanning the text and pulling out the billing details.
           </p>
@@ -184,7 +192,7 @@ export default function Home() {
               />
             </svg>
             <h2 className="mt-3 text-lg font-semibold text-slate-900">
-              We couldn&apos;t read that bill
+              We couldn&apos;t read that
             </h2>
             <p role="alert" className="mx-auto mt-2 max-w-md text-sm text-slate-600">
               {errorMessage}
@@ -209,14 +217,9 @@ export default function Home() {
         </section>
       )}
 
-      {stage === "results" && results && (
+      {stage === "results" && entries.length > 0 && (
         <div className="animate-fade-in-up">
-          <ResultsView
-            result={results.data}
-            rawText={results.rawText}
-            notice={results.notice}
-            onStartOver={startOver}
-          />
+          <ResultsView entries={entries} onStartOver={startOver} />
         </div>
       )}
     </main>
