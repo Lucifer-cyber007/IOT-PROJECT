@@ -10,6 +10,10 @@ env/
 .env.local
 *.local
 
+# GCP service account keys (Vertex AI credentials) - never commit these
+*service-account*.json
+*-key.json
+
 # Node / Next.js
 node_modules/
 .next/

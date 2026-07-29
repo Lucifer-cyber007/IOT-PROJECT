@@ -4,7 +4,8 @@ Upload or photograph an electricity bill (image or PDF) and get the billing deta
 structured, editable data.
 
 **Pipeline:** upload → PDF rasterized with PyMuPDF (if needed) → Google Cloud Vision
-`DOCUMENT_TEXT_DETECTION` → Groq `llama-3.3-70b-versatile` field extraction → JSON.
+`DOCUMENT_TEXT_DETECTION` → Vertex AI (Gemini `gemini-2.5-flash-lite` by default) field
+extraction → JSON.
 
 ## Stack
 
@@ -13,7 +14,7 @@ structured, editable data.
 | Frontend | Next.js 14 (App Router), TypeScript, Tailwind CSS, react-webcam |
 | Backend  | FastAPI, httpx |
 | OCR      | Google Cloud Vision API (`images:annotate`, DOCUMENT_TEXT_DETECTION) |
-| Parsing  | Groq API (`llama-3.3-70b-versatile`) |
+| Parsing  | Vertex AI Gemini (`generateContent`, `gemini-2.5-flash-lite` by default) |
 | PDF prep | PyMuPDF (fitz), rendered at ~300 DPI in memory |
 
 ## Response schema
@@ -52,13 +53,33 @@ cp .env.example .env            # then fill in your API keys
 uvicorn main:app --reload --port 8000
 ```
 
-Get the keys from:
-- **Vision** — enable the Cloud Vision API, then create an API key at
-  <https://console.cloud.google.com/apis/credentials>
-- **Groq** — <https://console.groq.com/keys>
+**Vision** — enable the Cloud Vision API, then create an API key at
+<https://console.cloud.google.com/apis/credentials>.
+
+**Vertex AI** authenticates with a service account, not an API key:
+
+```bash
+# 1. Enable the API and billing on your GCP project (Vertex AI has no permanent free tier)
+gcloud services enable aiplatform.googleapis.com --project=YOUR_PROJECT_ID
+
+# 2. Create a service account and grant it the Vertex AI User role
+gcloud iam service-accounts create bill-extractor --display-name="Electricity Bill Extractor"
+gcloud projects add-iam-policy-binding YOUR_PROJECT_ID \
+  --member="serviceAccount:bill-extractor@YOUR_PROJECT_ID.iam.gserviceaccount.com" \
+  --role="roles/aiplatform.user"
+
+# 3. Download a key for it and point GOOGLE_APPLICATION_CREDENTIALS at the file
+gcloud iam service-accounts keys create ./backend/vertex-service-account.json \
+  --iam-account=bill-extractor@YOUR_PROJECT_ID.iam.gserviceaccount.com
+```
+
+Then set `VERTEX_PROJECT_ID`, `VERTEX_REGION` and `GOOGLE_APPLICATION_CREDENTIALS` in `.env`
+(see `.env.example` for the full commented reference). The downloaded JSON key is matched by
+the repo's `.gitignore` (`*service-account*.json`) — verify with `git status` before committing
+near it regardless.
 
 `MOCK_MODE=1` in `.env` skips both API calls and returns fixed sample data, which is handy for
-working on the frontend or smoke-testing the server before you have keys.
+working on the frontend or smoke-testing the server before you have Vertex AI set up.
 
 ### Frontend
 
@@ -125,12 +146,13 @@ field comes out wrong and you want to see what the OCR actually produced.
 | 413 | File exceeds the size limit |
 | 415 | Unsupported file type |
 | 422 | OCR worked but the fields could not be structured — body includes `raw_text` and the UI falls back to manual entry |
-| 502 | Vision or Groq call failed |
+| 502 | Vision or Vertex AI call failed |
 
 Transient Vision failures (429s, 5xx, `UNAVAILABLE`) are retried up to 3 times with exponential
-backoff. Groq 429s are retried up to 5 times honoring the wait time Groq's own error message
-states (e.g. "try again in 2.6s") rather than a fixed backoff — a short fixed delay just retries
-into the same exhausted per-minute token window and burns attempts for nothing.
+backoff. Vertex AI 429s are retried up to 5 times honoring the exact wait time Google's own
+error response states (via a structured `RetryInfo` detail or a `Retry-After` header) rather
+than a fixed backoff — a short fixed delay just retries into the same exhausted per-minute quota
+and burns attempts for nothing.
 
 ### `POST /api/extract-batch`
 
@@ -153,9 +175,10 @@ the batch:
 ```
 
 Tune with `MAX_BATCH_FILES`, `BATCH_CONCURRENCY` and `BATCH_STAGGER_SECONDS` in `.env`.
-`BATCH_CONCURRENCY` defaults to 2 because Groq's free tier caps at 12,000 tokens/minute and one
-bill extraction uses roughly 2,000-2,200 of them — 4 concurrent requests can exhaust the whole
-budget in a single burst before any of them lands. Raise it if you're on a paid Groq tier.
+`BATCH_CONCURRENCY` defaults to a conservative 2 because a freshly created GCP project often
+starts with a modest per-minute quota that only scales up with usage history. Vertex AI's
+ceiling is generally far higher than that once established — check **Cloud Console → IAM &
+Admin → Quotas** for your project's actual limit and raise this once you know it.
 
 ### `POST /api/export/xlsx`
 
@@ -168,7 +191,11 @@ corrections the user typed in are what land in the spreadsheet.
 
 ### `GET /api/health`
 
-Reports server status and which API keys are configured.
+Reports server status and whether Vision/Vertex AI are configured. This only checks that
+values are *present* (a key file exists at the given path, a project ID is set) — it cannot
+confirm they're actually valid (e.g. a project ID typo or a service account missing the
+Vertex AI User role) without making a real call. A real `/api/extract` request is the only way
+to confirm auth actually works.
 
 ## Notes
 
@@ -187,7 +214,8 @@ Reports server status and which API keys are configured.
 backend/
   main.py            FastAPI app, CORS, routes, file validation
   vision_ocr.py      PDF→PNG rasterization + Google Vision call
-  llm_parser.py      Groq call, JSON extraction, schema validation + retry
+  llm_parser.py      Vertex AI (Gemini) call, JSON extraction, schema validation + retry
+  excel_export.py    Formatted .xlsx generation via openpyxl
   requirements.txt
   .env.example
 frontend/
