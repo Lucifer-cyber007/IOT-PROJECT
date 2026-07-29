@@ -1,7 +1,6 @@
 """Electricity Bill Extractor - FastAPI backend.
 
-Flow: upload -> (PDF rasterize) -> Google Cloud Vision OCR -> Vertex AI (Gemini)
-field extraction -> JSON.
+Flow: upload -> (PDF rasterize) -> Google Cloud Vision OCR -> Groq field extraction -> JSON.
 """
 
 from __future__ import annotations
@@ -39,17 +38,16 @@ MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
 
 # Cap on files per batch request, and how many we OCR/parse at once.
 #
-# BATCH_CONCURRENCY defaults low and conservative: a freshly created GCP project
-# often starts with a modest per-minute quota for a Gemini model on Vertex AI
-# that only scales up with usage history, so a burst of concurrent requests can
-# still trip a 429 on day one even though Vertex AI's ceiling is generally far
-# higher than Groq's free tier once established. Raise this once you've
-# confirmed your project's actual quota (Cloud Console -> IAM & Admin -> Quotas).
+# BATCH_CONCURRENCY defaults low deliberately: Groq's free tier caps at 12,000
+# tokens/minute and a single bill extraction uses ~2,000-2,200 of them, so 4
+# concurrent requests can exhaust the whole per-minute budget in one burst
+# before any of them lands. 2 leaves headroom; raise it if you're on a paid
+# Groq tier with more TPM.
 MAX_BATCH_FILES = int(os.getenv("MAX_BATCH_FILES", "25"))
 BATCH_CONCURRENCY = int(os.getenv("BATCH_CONCURRENCY", "2"))
 # Extra spacing between a batch's requests starting, on top of the concurrency
 # cap above - smooths out the burst further so a wave of N requests doesn't
-# all land on Vertex AI in the same instant.
+# all land on Groq in the same instant.
 BATCH_STAGGER_SECONDS = float(os.getenv("BATCH_STAGGER_SECONDS", "0.4"))
 
 MOCK_RESPONSE = {
@@ -191,22 +189,12 @@ async def _run_pipeline(
 
 @app.get("/api/health")
 async def health() -> dict:
-    """Cheap readiness probe that also reports whether the app is configured to run.
-
-    This does not verify the credentials actually work (e.g. a wrong project ID
-    or a service account missing the Vertex AI User role) - only that the app
-    has been given something to try. A real /api/extract call is the only way
-    to confirm auth is actually valid.
-    """
-    credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+    """Cheap readiness probe that also reports which API keys are configured."""
     return {
         "status": "ok",
         "mock_mode": _is_mock_mode(),
         "vision_key_configured": bool(os.getenv("GOOGLE_CLOUD_VISION_API_KEY")),
-        "vertex_project_configured": bool(os.getenv("VERTEX_PROJECT_ID")),
-        "vertex_credentials_configured": bool(
-            credentials_path and os.path.isfile(credentials_path)
-        ),
+        "groq_key_configured": bool(os.getenv("GROQ_API_KEY")),
         "max_upload_mb": MAX_UPLOAD_MB,
         "max_batch_files": MAX_BATCH_FILES,
     }

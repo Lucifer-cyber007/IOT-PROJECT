@@ -1,4 +1,4 @@
-"""Vertex AI (Gemini)-backed extraction of structured bill fields from raw OCR text."""
+"""Groq-backed extraction of structured bill fields from raw OCR text."""
 
 from __future__ import annotations
 
@@ -10,28 +10,24 @@ import random
 import re
 
 import httpx
-from google.auth.transport.requests import Request as GoogleAuthRequest
-from google.oauth2 import service_account
 
 logger = logging.getLogger(__name__)
 
-DEFAULT_MODEL = "gemini-2.5-flash-lite"
-DEFAULT_REGION = "us-central1"
-TOKEN_SCOPES = ["https://www.googleapis.com/auth/cloud-platform"]
+GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
+DEFAULT_MODEL = "llama-3.3-70b-versatile"
 
 # Transient conditions worth another attempt rather than failing the extraction.
 RETRYABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
 BACKOFF_BASE_SECONDS = 0.6
-MAX_RETRY_AFTER_SECONDS = 20.0
-# A 429 body from Google's API sometimes carries a structured RetryInfo detail with
-# the exact wait, e.g. {"@type": ".../google.rpc.RetryInfo", "retryDelay": "5s"}.
+# Groq's 429 body names the exact wait, e.g. "Please try again in 2.6s" or "170ms".
 # Respecting that (instead of a short fixed backoff) is what actually clears a
-# per-minute quota; a fixed 1-2s backoff just re-hits the same exhausted window.
-RETRY_DELAY_RE = re.compile(r"^(\d+(?:\.\d+)?)s$")
+# token-per-minute limit; a fixed 1-2s backoff just re-hits the same window.
+RETRY_AFTER_RE = re.compile(r"try again in (\d+(?:\.\d+)?)(ms|s)\b", re.IGNORECASE)
+MAX_RETRY_AFTER_SECONDS = 20.0
 
 
 def _retry_after_seconds(response: httpx.Response) -> float | None:
-    """Extract Vertex AI's suggested wait time from a 429, in seconds."""
+    """Extract Groq's suggested wait time from a 429, in seconds."""
     header = response.headers.get("retry-after")
     if header:
         try:
@@ -39,20 +35,14 @@ def _retry_after_seconds(response: httpx.Response) -> float | None:
         except ValueError:
             pass
 
-    try:
-        body = response.json()
-    except ValueError:
-        return None
-
-    for detail in body.get("error", {}).get("details", []):
-        delay = detail.get("retryDelay")
-        if isinstance(delay, str):
-            match = RETRY_DELAY_RE.match(delay)
-            if match:
-                return min(float(match.group(1)), MAX_RETRY_AFTER_SECONDS)
+    match = RETRY_AFTER_RE.search(response.text)
+    if match:
+        value = float(match.group(1))
+        if match.group(2).lower() == "ms":
+            value /= 1000
+        return min(value, MAX_RETRY_AFTER_SECONDS)
 
     return None
-
 
 FIELDS = (
     "name",
@@ -168,7 +158,7 @@ RETRY_REMINDER = (
 
 
 class LlmError(RuntimeError):
-    """Raised when Vertex AI cannot be reached or is misconfigured."""
+    """Raised when Groq cannot be reached or is misconfigured."""
 
 
 class LlmParseError(RuntimeError):
@@ -447,125 +437,59 @@ def validate_and_normalize(payload: dict, ocr_text: str = "") -> dict:
     return result
 
 
-# --- Authentication -----------------------------------------------------------
-#
-# Vertex AI authenticates with an OAuth2 bearer token from a service account,
-# not a static API key. The token is cached at module scope and only refreshed
-# once it is near expiry (tokens last ~1 hour). All access goes through a lock
-# so a burst of concurrent batch requests doesn't each trigger their own
-# refresh, or race on first-load of the credentials object.
-
-_credentials: service_account.Credentials | None = None
-_credentials_lock = asyncio.Lock()
-
-
-async def _get_access_token() -> str:
-    async with _credentials_lock:
-        global _credentials
-        if _credentials is None:
-            key_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-            if not key_path:
-                raise LlmError(
-                    "GOOGLE_APPLICATION_CREDENTIALS is not set on the server. It must "
-                    "point at a Vertex AI service account JSON key file."
-                )
-            if not os.path.isfile(key_path):
-                raise LlmError(
-                    f"GOOGLE_APPLICATION_CREDENTIALS points at '{key_path}', "
-                    "which does not exist."
-                )
-            try:
-                _credentials = service_account.Credentials.from_service_account_file(
-                    key_path, scopes=TOKEN_SCOPES
-                )
-            except (ValueError, OSError) as exc:
-                raise LlmError(
-                    f"Could not load the Vertex AI service account key: {exc}"
-                ) from exc
-
-        if not _credentials.valid:
-            try:
-                await asyncio.to_thread(_credentials.refresh, GoogleAuthRequest())
-            except Exception as exc:  # noqa: BLE001 - surfaced as a clear LlmError
-                raise LlmError(f"Could not obtain a Vertex AI access token: {exc}") from exc
-
-        return _credentials.token
-
-
-async def _call_vertex(
+async def _call_groq(
     client: httpx.AsyncClient,
-    endpoint: str,
+    api_key: str,
+    model: str,
     system_prompt: str,
     ocr_text: str,
     max_attempts: int = 5,
 ) -> str:
-    """Call Vertex AI's Gemini generateContent endpoint, retrying transient failures.
+    """Call Groq, retrying transient failures.
 
-    Batch uploads run several extractions at once, which makes it easy to trip a
-    per-minute quota even though each individual call is well within it. On a
-    429, Google's response sometimes states exactly how long to wait via a
-    structured RetryInfo detail - that is honored here rather than guessed at
-    with a short fixed backoff, which would just retry into the same exhausted
-    window and burn all attempts before the quota actually recovers.
+    Batch uploads run several extractions at once, which makes it easy to trip
+    Groq's tokens-per-minute limit even though each individual call is well
+    within it. On a 429, Groq's response body states exactly how long the
+    caller must wait for the window to clear (e.g. "try again in 2.6s") - that
+    is honored here rather than guessed at with a short fixed backoff, which
+    would just retry into the same exhausted window and burn all attempts
+    before the quota actually recovers.
     """
-    request_body = {
-        "systemInstruction": {"parts": [{"text": system_prompt}]},
-        "contents": [
+    request = {
+        "model": model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
             {
                 "role": "user",
-                "parts": [{"text": f"Raw OCR text of the electricity bill:\n\n{ocr_text}"}],
-            }
+                "content": f"Raw OCR text of the electricity bill:\n\n{ocr_text}",
+            },
         ],
-        "generationConfig": {
-            "temperature": 0,
-            "responseMimeType": "application/json",
-        },
     }
 
-    last_error = "Vertex AI could not be reached."
+    last_error = "Groq could not be reached."
 
     for attempt in range(1, max_attempts + 1):
         retry_after: float | None = None
 
         try:
-            token = await _get_access_token()
             response = await client.post(
-                endpoint,
-                headers={"Authorization": f"Bearer {token}"},
-                json=request_body,
+                GROQ_ENDPOINT,
+                headers={"Authorization": f"Bearer {api_key}"},
+                json=request,
             )
-        except LlmError:
-            # Configuration problems (missing key file, bad credentials) will not
-            # resolve themselves on retry - surface immediately.
-            raise
         except httpx.HTTPError as exc:
-            last_error = f"Could not reach Vertex AI: {exc}"
+            last_error = f"Could not reach Groq: {exc}"
         else:
             if response.status_code == 200:
+                body = response.json()
                 try:
-                    body = response.json()
-                except ValueError as exc:
-                    raise LlmError(f"Vertex AI returned an unparseable response: {exc}") from exc
+                    return body["choices"][0]["message"]["content"] or ""
+                except (KeyError, IndexError, TypeError) as exc:
+                    raise LlmError(f"Unexpected Groq response shape: {body}") from exc
 
-                candidates = body.get("candidates") or []
-                if not candidates:
-                    block_reason = body.get("promptFeedback", {}).get("blockReason")
-                    raise LlmError(
-                        f"Vertex AI returned no candidates (blockReason={block_reason})."
-                    )
-
-                parts = candidates[0].get("content", {}).get("parts") or []
-                text = "".join(part.get("text", "") for part in parts)
-                if not text:
-                    finish_reason = candidates[0].get("finishReason")
-                    raise LlmError(
-                        f"Vertex AI returned an empty response (finishReason={finish_reason})."
-                    )
-                return text
-
-            last_error = (
-                f"Vertex AI returned HTTP {response.status_code}: {response.text[:400]}"
-            )
+            last_error = f"Groq API returned HTTP {response.status_code}: {response.text[:400]}"
             if response.status_code not in RETRYABLE_HTTP_STATUSES:
                 raise LlmError(last_error)
             if response.status_code == 429:
@@ -580,7 +504,7 @@ async def _call_vertex(
             delay = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.4)
 
         logger.warning(
-            "Vertex AI attempt %d/%d failed (%s); retrying in %.1fs",
+            "Groq attempt %d/%d failed (%s); retrying in %.1fs",
             attempt,
             max_attempts,
             last_error,
@@ -591,37 +515,26 @@ async def _call_vertex(
     raise LlmError(f"{last_error} (after {max_attempts} attempts)")
 
 
-async def parse_bill(
-    ocr_text: str,
-    project_id: str | None = None,
-    region: str | None = None,
-    model: str | None = None,
-) -> dict:
+async def parse_bill(ocr_text: str, api_key: str | None = None, model: str | None = None) -> dict:
     """Extract structured fields from OCR text, retrying once on unparseable output.
 
     Raises LlmParseError (carrying the raw model output) if both attempts fail.
     """
-    project_id = project_id or os.getenv("VERTEX_PROJECT_ID")
-    if not project_id:
-        raise LlmError("VERTEX_PROJECT_ID is not set on the server.")
+    api_key = api_key or os.getenv("GROQ_API_KEY")
+    if not api_key:
+        raise LlmError("GROQ_API_KEY is not set on the server.")
 
-    region = region or os.getenv("VERTEX_REGION") or DEFAULT_REGION
-    model = model or os.getenv("VERTEX_MODEL") or DEFAULT_MODEL
-
-    endpoint = (
-        f"https://{region}-aiplatform.googleapis.com/v1/projects/{project_id}"
-        f"/locations/{region}/publishers/google/models/{model}:generateContent"
-    )
+    model = model or os.getenv("GROQ_MODEL") or DEFAULT_MODEL
 
     last_raw = ""
     async with httpx.AsyncClient(timeout=90.0) as client:
         for attempt in (1, 2):
             system_prompt = SYSTEM_PROMPT if attempt == 1 else SYSTEM_PROMPT + RETRY_REMINDER
-            last_raw = await _call_vertex(client, endpoint, system_prompt, ocr_text)
+            last_raw = await _call_groq(client, api_key, model, system_prompt, ocr_text)
             try:
                 return validate_and_normalize(_extract_json_object(last_raw), ocr_text)
             except (json.JSONDecodeError, ValueError) as exc:
-                logger.warning("Vertex AI JSON parse failed on attempt %d: %s", attempt, exc)
+                logger.warning("Groq JSON parse failed on attempt %d: %s", attempt, exc)
 
     raise LlmParseError(
         "The model did not return valid JSON after a retry.", raw_response=last_raw
