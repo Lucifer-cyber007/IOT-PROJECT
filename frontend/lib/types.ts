@@ -1,50 +1,110 @@
-export type ConfidenceFlag = "low_confidence" | "not_found";
+/**
+ * Wire-format types matching backend/schemas.py exactly (snake_case, no camelCase
+ * transform layer) - the same convention the mobile app's lib/types.ts already uses.
+ */
 
-export interface BillFields {
-  name: string | null;
-  rr_number: string | null;
-  address: string | null;
-  account_number: string | null;
-  units_consumed: string | null;
-  amount_to_pay: string | null;
-  tariff: string | null;
-  bill_date: string | null;
+export type Role = "admin" | "client";
+
+export type NormalizerType = "text" | "digits" | "number" | "date";
+export type KeyboardType = "default" | "numeric" | "decimal-pad";
+
+export interface AssetClass {
+  id: string;
+  label: string;
+  icon: string;
 }
 
-export type BillFieldKey = keyof BillFields;
-
-export interface ExtractionResult extends BillFields {
-  confidence_flags: Partial<Record<BillFieldKey, ConfidenceFlag>>;
-}
-
-interface FieldMeta {
-  key: BillFieldKey;
+export interface FieldSchema {
+  key: string;
   label: string;
   placeholder: string;
-  multiline?: boolean;
-  inputMode?: "text" | "numeric" | "decimal";
+  keyboard_type: KeyboardType;
+  normalizer_type: NormalizerType;
+  min_length: number | null;
+  max_length: number | null;
+  synonyms: string[];
 }
 
-/** Display order for the results view, the CSV export and the JSON copy. */
-export const FIELD_META: FieldMeta[] = [
-  { key: "name", label: "Name", placeholder: "Consumer name" },
-  { key: "rr_number", label: "RR Number", placeholder: "RR number from the bill" },
-  { key: "address", label: "Address", placeholder: "Service address", multiline: true },
-  { key: "account_number", label: "Account Number", placeholder: "Account / consumer number" },
-  { key: "units_consumed", label: "Units Consumed", placeholder: "Units for this period", inputMode: "numeric" },
-  { key: "amount_to_pay", label: "Amount to be Paid", placeholder: "Net payable", inputMode: "decimal" },
-  { key: "tariff", label: "Tariff", placeholder: "Tariff code" },
-  { key: "bill_date", label: "Bill Date", placeholder: "DD-MM-YYYY" },
-];
+export interface MachineTemplate {
+  id: number;
+  asset_class_id: string;
+  name: string;
+  manufacturer: string | null;
+  capture_methods: string[];
+  identifier_field_key: string;
+  fields: FieldSchema[];
+  prompt_instructions: string | null;
+  quirks: string[];
+}
 
-export const EMPTY_RESULT: ExtractionResult = {
-  name: null,
-  rr_number: null,
-  address: null,
-  account_number: null,
-  units_consumed: null,
-  amount_to_pay: null,
-  tariff: null,
-  bill_date: null,
-  confidence_flags: {},
-};
+export interface Machine {
+  id: number;
+  client_id: number;
+  template_id: number;
+  name: string;
+  identifier_value: string;
+  created_at: string;
+  template: MachineTemplate;
+}
+
+export type ConfidenceFlag = "low_confidence" | "not_found";
+
+export interface Reading {
+  id: number;
+  machine_id: number;
+  captured_at: string;
+  capture_method: "ocr" | "manual";
+  fields: Record<string, string | null>;
+  confidence_flags: Record<string, ConfidenceFlag> | null;
+  raw_text: string | null;
+}
+
+export interface ClientRecord {
+  id: number;
+  name: string;
+  created_at: string;
+}
+
+export interface UserRecord {
+  id: number;
+  email: string;
+  role: Role;
+  client_id: number | null;
+}
+
+// --- Scan -------------------------------------------------------------------
+
+export interface ScanMatched {
+  status: "matched";
+  machine: Machine;
+  fields: Record<string, string | null>;
+  confidence_flags: Record<string, ConfidenceFlag>;
+  raw_text: string;
+}
+
+export interface ScanUnresolved {
+  status: "ambiguous" | "no_match";
+  candidates: Machine[];
+  raw_text: string;
+}
+
+export type ScanResult = ScanMatched | ScanUnresolved;
+
+export interface BatchScanItem {
+  index: number;
+  filename: string;
+  status: "matched" | "ambiguous" | "no_match" | "error";
+  machine?: Machine;
+  fields?: Record<string, string | null>;
+  confidence_flags?: Record<string, ConfidenceFlag>;
+  candidates?: Machine[];
+  raw_text?: string;
+  error?: string;
+}
+
+export interface BatchScanResponse {
+  results: BatchScanItem[];
+  matched: number;
+  unresolved: number;
+  failed: number;
+}

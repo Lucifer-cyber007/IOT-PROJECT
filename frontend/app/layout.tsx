@@ -1,10 +1,10 @@
 import type { Metadata, Viewport } from "next";
 import "./globals.css";
+import { AuthProvider } from "@/lib/auth-context";
 
 export const metadata: Metadata = {
-  title: "Electricity Bill Extractor",
-  description:
-    "Upload or photograph an electricity bill and get the billing details as structured data.",
+  title: "WRV Energies",
+  description: "Multi-asset IoT monitoring: scan, track and manage readings across your equipment.",
 };
 
 export const viewport: Viewport = {
@@ -20,7 +20,9 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <AuthProvider>{children}</AuthProvider>
+      </body>
     </html>
   );
 }

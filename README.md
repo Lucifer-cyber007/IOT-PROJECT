@@ -27,7 +27,7 @@ Google Cloud Vision `DOCUMENT_TEXT_DETECTION` → match against your registered 
 | -------- | ---- |
 | Backend  | FastAPI, SQLAlchemy + SQLite, JWT auth (PyJWT + bcrypt), httpx |
 | Mobile   | Expo / React Native (SDK 54) |
-| Frontend | Next.js 14 (App Router), TypeScript, Tailwind CSS — **not yet updated** to the multi-tenant API; still the original single-file bill scanner (see Known gaps) |
+| Frontend | Next.js 14 (App Router), TypeScript, Tailwind CSS — client portal + admin console, both against the multi-tenant API |
 | OCR      | Google Cloud Vision API (`images:annotate`, DOCUMENT_TEXT_DETECTION) |
 | Parsing  | Groq API (`llama-3.3-70b-versatile`), retried with backoff on transient failures |
 | PDF prep | PyMuPDF (fitz), rendered at ~300 DPI in memory |
@@ -69,6 +69,27 @@ Generate a `JWT_SECRET` with `python -c "import secrets; print(secrets.token_hex
 Once seeded, log in as the admin (`POST /api/auth/login`) and use the admin endpoints below to
 create a client, a machine template, and a machine — there's no admin console UI yet (see Known
 gaps), so this is curl/Postman/whatever-you-like for now.
+
+### Frontend (Next.js)
+
+```bash
+cd frontend
+npm install
+cp .env.local.example .env.local   # NEXT_PUBLIC_API_BASE_URL, defaults to http://localhost:8000
+npm run dev
+```
+
+Open <http://localhost:3000> — it redirects to `/login`, then to `/dashboard` (client role) or
+`/admin/clients` (admin role) depending on who logs in. There's no signup: seed the first admin
+via `python seed.py` in the backend, then use the admin console's Users page (or
+`POST /api/admin/users`) to create further admins or client logins. A brand-new client has no
+asset classes populated until an admin creates at least one machine template and assigns a
+machine to them.
+
+Auth is a plain bearer token in `localStorage` (no cookies, no Next.js middleware) — the same
+model the mobile app uses, just swapping `expo-file-system` for the browser's own storage.
+Upload is drag-and-drop/file-picker only; there is no live camera capture on desktop (the mobile
+app already owns that).
 
 ### Mobile app (Expo / React Native)
 
@@ -153,11 +174,11 @@ Reports server status and which API keys are configured.
 
 ## Known gaps
 
-- **No admin console UI.** Everything under `/api/admin/*` is API-only right now — provisioning a
-  client, template or machine means calling the API directly.
-- **The Next.js `frontend/` app is stale.** It still talks to the old unauthenticated single-schema
-  `/api/extract` shape and hasn't been updated for the multi-tenant API. Use the mobile app or the
-  API directly until it's rebuilt.
+- **No admin edit/delete anywhere.** `/api/admin/*` is create+list only — no `PATCH`/`DELETE` on
+  clients, users, templates or machines, and no `GET /api/admin/users` (a created login cannot be
+  listed or recovered after the fact — the admin Users page is a one-way form with a warning
+  banner, by design, until a listing endpoint exists).
+- **Admin has no visibility into readings.** Reading history is `require_client`-scoped only.
 
 ## Project structure
 
@@ -174,7 +195,33 @@ backend/
   llm_parser.py          Groq call, template-driven prompt + extraction, retry/backoff
   requirements.txt
   .env.example
-frontend/                Next.js web app - stale, see Known gaps
+frontend/
+  app/login/page.tsx              Email/password sign-in
+  app/page.tsx                     Redirect-only: resolves to /dashboard or /admin/clients by role
+  app/(client)/layout.tsx          Client-role route guard + sidebar shell
+  app/(client)/dashboard/          Asset-class grid with live counts
+  app/(client)/asset-classes/[id]/ Machine list, add-asset form, entry to batch scan
+  app/(client)/asset-classes/[id]/batch-scan/  Up to 10 files, review/resolve/save each
+  app/(client)/machines/[id]/     Reading history table, manual-entry form
+  app/(client)/scan/               Generic single-scan flow (any asset class)
+  app/(client)/history/            All readings, asset-class filter, CSV export
+  app/(client)/profile/            Account info, log out
+  app/admin/layout.tsx             Admin-role route guard + sidebar shell
+  app/admin/clients/               List + create
+  app/admin/users/                 Create-only form (see Known gaps)
+  app/admin/templates/             List + link to .../new
+  app/admin/templates/new/         Full template form incl. FieldSchemaBuilder
+  app/admin/machines/              Client-filtered list + link to .../new
+  app/admin/machines/new/          Assign a machine to any client
+  components/fields/FieldSchemaForm.tsx   Template-driven form - shared by manual entry,
+                                    single-scan results, and batch-scan review
+  components/admin/FieldSchemaBuilder.tsx Admin's field-schema editor (add/reorder/remove fields)
+  components/scan/CandidatePicker.tsx     Ambiguous/no-match machine picker, shared by both scan flows
+  components/scan/UploadDropzone.tsx      Drag-and-drop file picker (upload only, no camera)
+  lib/api.ts                       Authenticated fetch client for every endpoint above
+  lib/auth-context.tsx             3-state session (checking/signed-out/session), localStorage-backed
+  lib/types.ts                     Wire-format types matching backend/schemas.py
+  lib/csv.ts                       Client-side CSV export
 mobile/
   App.tsx                Auth gate (LoginScreen vs the tab shell) + tab navigation
   lib/api.ts              Authenticated fetch client for every endpoint above

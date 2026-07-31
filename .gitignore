@@ -17,6 +17,10 @@ backend/backend.log
 .env.local
 *.local
 
+# GCP service account keys - never commit these
+*service-account*.json
+*-key.json
+
 # Node / Next.js
 node_modules/
 .next/
