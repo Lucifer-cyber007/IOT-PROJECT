@@ -1,47 +1,46 @@
-import { useMemo, useState } from "react";
-import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text } from "react-native";
+import { useState } from "react";
+import { KeyboardAvoidingView, Platform, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import FieldCard from "../components/FieldCard";
 import SafeButton from "../components/SafeButton";
-import type { Asset } from "../lib/assets";
-import { getAssetClass } from "../lib/assetClasses";
-import { addReading } from "../lib/readings";
+import * as api from "../lib/api";
+import type { Machine } from "../lib/types";
 import { colors, radius, spacing } from "../lib/theme";
 
 interface ManualEntryScreenProps {
-  asset: Asset;
+  machine: Machine;
   onDone: () => void;
   onCancel: () => void;
 }
 
-export default function ManualEntryScreen({ asset, onDone, onCancel }: ManualEntryScreenProps) {
-  const assetClass = useMemo(() => getAssetClass(asset.classId), [asset.classId]);
+export default function ManualEntryScreen({ machine, onDone, onCancel }: ManualEntryScreenProps) {
+  const { fields } = machine.template;
   const [values, setValues] = useState<Record<string, string>>(() =>
-    assetClass.fields.reduce<Record<string, string>>((accumulator, field) => {
+    fields.reduce<Record<string, string>>((accumulator, field) => {
       accumulator[field.key] = "";
       return accumulator;
     }, {})
   );
   const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
   const handleSave = async () => {
     setSaving(true);
+    setError(null);
     try {
-      const fields = assetClass.fields.reduce<Record<string, string | null>>(
-        (accumulator, field) => {
-          const value = values[field.key].trim();
-          accumulator[field.key] = value === "" ? null : value;
-          return accumulator;
-        },
-        {}
-      );
-      await addReading({
-        assetId: asset.id,
-        classId: asset.classId,
+      const payload = fields.reduce<Record<string, string | null>>((accumulator, field) => {
+        const value = values[field.key].trim();
+        accumulator[field.key] = value === "" ? null : value;
+        return accumulator;
+      }, {});
+      await api.createReading({
+        machineId: machine.id,
         captureMethod: "manual",
-        fields,
+        fields: payload,
       });
       onDone();
+    } catch (err) {
+      setError(err instanceof api.ApiError ? err.message : "Could not save that reading.");
     } finally {
       setSaving(false);
     }
@@ -56,17 +55,22 @@ export default function ManualEntryScreen({ asset, onDone, onCancel }: ManualEnt
         <ScrollView contentContainerStyle={styles.content} keyboardShouldPersistTaps="handled">
           <Text style={styles.heading}>New Reading</Text>
           <Text style={styles.subheading}>
-            {assetClass.label} · {asset.name}
+            {machine.template.name} · {machine.name}
           </Text>
 
-          {assetClass.fields.map((field) => (
+          {error && (
+            <View style={styles.errorBox}>
+              <Text style={styles.errorText}>{error}</Text>
+            </View>
+          )}
+
+          {fields.map((field) => (
             <FieldCard
               key={field.key}
               label={field.label}
               value={values[field.key]}
               placeholder={field.placeholder}
-              multiline={field.multiline}
-              keyboardType={field.keyboardType}
+              keyboardType={field.keyboard_type}
               onChange={(next) => setValues((previous) => ({ ...previous, [field.key]: next }))}
             />
           ))}
@@ -103,6 +107,18 @@ const styles = StyleSheet.create({
     fontSize: 13,
     color: colors.slate500,
     marginBottom: spacing.sm,
+  },
+  errorBox: {
+    backgroundColor: colors.roseSoft,
+    borderWidth: 1,
+    borderColor: colors.rose,
+    borderRadius: radius.md,
+    padding: spacing.md,
+  },
+  errorText: {
+    color: colors.roseInk,
+    fontSize: 13,
+    lineHeight: 18,
   },
   primaryButton: {
     backgroundColor: colors.ink,

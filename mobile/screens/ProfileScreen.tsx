@@ -1,34 +1,18 @@
-import { useState } from "react";
 import { Alert, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import SafeButton from "../components/SafeButton";
-import { clearReadings } from "../lib/readings";
 import { colors, radius, spacing } from "../lib/theme";
 
-export default function ProfileScreen() {
-  const [clearing, setClearing] = useState(false);
+interface ProfileScreenProps {
+  onLogout: () => void;
+}
 
-  const handleClearHistory = () => {
-    Alert.alert(
-      "Clear scan history?",
-      "This removes every previously scanned bill from this device. This cannot be undone.",
-      [
-        { text: "Cancel", style: "cancel" },
-        {
-          text: "Clear",
-          style: "destructive",
-          onPress: async () => {
-            setClearing(true);
-            try {
-              await clearReadings();
-              Alert.alert("Done", "Scan history cleared.");
-            } finally {
-              setClearing(false);
-            }
-          },
-        },
-      ]
-    );
+export default function ProfileScreen({ onLogout }: ProfileScreenProps) {
+  const handleLogout = () => {
+    Alert.alert("Log out?", "You'll need to sign in again to scan or view machines.", [
+      { text: "Cancel", style: "cancel" },
+      { text: "Log out", style: "destructive", onPress: onLogout },
+    ]);
   };
 
   return (
@@ -48,11 +32,9 @@ export default function ProfileScreen() {
       </View>
 
       <View style={styles.card}>
-        <Text style={styles.cardTitle}>Data</Text>
-        <SafeButton style={styles.dangerButton} onPress={handleClearHistory} disabled={clearing}>
-          <Text style={styles.dangerButtonText}>
-            {clearing ? "Clearing..." : "Clear Scan History"}
-          </Text>
+        <Text style={styles.cardTitle}>Account</Text>
+        <SafeButton style={styles.dangerButton} onPress={handleLogout}>
+          <Text style={styles.dangerButtonText}>Log out</Text>
         </SafeButton>
       </View>
     </SafeAreaView>

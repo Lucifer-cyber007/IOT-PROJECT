@@ -14,53 +14,71 @@ import {
 import { SafeAreaView } from "react-native-safe-area-context";
 import FieldCard from "../components/FieldCard";
 import SafeButton from "../components/SafeButton";
+import * as api from "../lib/api";
+import type { Machine } from "../lib/types";
 import { colors, radius, spacing } from "../lib/theme";
-import { FIELD_META, type BillFieldKey, type ExtractionResult } from "../lib/types";
-
-type FieldValues = Record<BillFieldKey, string>;
-
-function toFieldValues(result: ExtractionResult): FieldValues {
-  return FIELD_META.reduce((accumulator, field) => {
-    accumulator[field.key] = result[field.key] ?? "";
-    return accumulator;
-  }, {} as FieldValues);
-}
 
 function escapeCsv(value: string): string {
   return `"${value.replace(/"/g, '""')}"`;
 }
 
 interface ResultsScreenProps {
-  result: ExtractionResult;
-  /** Raw OCR text, shown when the backend could not structure the fields. */
+  machine: Machine;
+  fields: Record<string, string | null>;
+  confidenceFlags: Record<string, string>;
+  /** Raw OCR text, kept around for the "show raw text" diagnostic toggle. */
   rawText?: string;
-  /** Explanatory banner shown above the fields (e.g. the manual-entry fallback). */
-  notice?: string;
-  onStartOver: () => void;
+  onSaved: () => void;
 }
 
 export default function ResultsScreen({
-  result,
+  machine,
+  fields,
+  confidenceFlags,
   rawText,
-  notice,
-  onStartOver,
+  onSaved,
 }: ResultsScreenProps) {
-  const [values, setValues] = useState<FieldValues>(() => toFieldValues(result));
+  const templateFields = machine.template.fields;
+  const [values, setValues] = useState<Record<string, string>>(() =>
+    templateFields.reduce<Record<string, string>>((accumulator, field) => {
+      accumulator[field.key] = fields[field.key] ?? "";
+      return accumulator;
+    }, {})
+  );
   const [copied, setCopied] = useState(false);
   const [showRawText, setShowRawText] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
 
-  const flags = result.confidence_flags ?? {};
-  const flaggedCount = Object.keys(flags).length;
+  const flaggedCount = Object.keys(confidenceFlags).length;
 
-  /** Current (possibly user-edited) values in the API's schema shape. */
   const payload = useMemo(() => {
-    const fields = FIELD_META.reduce<Record<string, string | null>>((accumulator, field) => {
+    const result: Record<string, string | null> = {};
+    for (const field of templateFields) {
       const value = values[field.key].trim();
-      accumulator[field.key] = value === "" ? null : value;
-      return accumulator;
-    }, {});
-    return { ...fields, confidence_flags: flags };
-  }, [values, flags]);
+      result[field.key] = value === "" ? null : value;
+    }
+    return result;
+  }, [values, templateFields]);
+
+  const handleSave = async () => {
+    setSaving(true);
+    setError(null);
+    try {
+      await api.createReading({
+        machineId: machine.id,
+        captureMethod: "ocr",
+        fields: payload,
+        confidenceFlags,
+        rawText,
+      });
+      onSaved();
+    } catch (err) {
+      setError(err instanceof api.ApiError ? err.message : "Could not save that reading.");
+    } finally {
+      setSaving(false);
+    }
+  };
 
   const handleCopy = async () => {
     await Clipboard.setStringAsync(JSON.stringify(payload, null, 2));
@@ -70,14 +88,11 @@ export default function ResultsScreen({
 
   const handleShareCsv = async () => {
     try {
-      const header = FIELD_META.map((field) => escapeCsv(field.label)).join(",");
-      const row = FIELD_META.map((field) => escapeCsv(values[field.key].trim())).join(",");
+      const header = templateFields.map((field) => escapeCsv(field.label)).join(",");
+      const row = templateFields.map((field) => escapeCsv(values[field.key].trim())).join(",");
+      const slug = machine.name.replace(/[^a-zA-Z0-9-_]/g, "").slice(0, 32);
 
-      const slug = (values.rr_number || values.account_number || "bill")
-        .replace(/[^a-zA-Z0-9-_]/g, "")
-        .slice(0, 32);
-
-      const file = new File(Paths.cache, `electricity-bill-${slug || "extract"}.csv`);
+      const file = new File(Paths.cache, `reading-${slug || "export"}.csv`);
       if (file.exists) file.delete();
       file.create();
       file.write(`${header}\n${row}\n`);
@@ -89,13 +104,13 @@ export default function ResultsScreen({
 
       await Sharing.shareAsync(file.uri, {
         mimeType: "text/csv",
-        dialogTitle: "Share bill details",
+        dialogTitle: "Share reading",
         UTI: "public.comma-separated-values-text",
       });
-    } catch (error) {
+    } catch (err) {
       Alert.alert(
         "Could not export",
-        error instanceof Error ? error.message : "The CSV could not be created."
+        err instanceof Error ? err.message : "The CSV could not be created."
       );
     }
   };
@@ -110,36 +125,28 @@ export default function ResultsScreen({
           contentContainerStyle={styles.scrollContent}
           keyboardShouldPersistTaps="handled"
         >
-          {notice && (
-            <View style={styles.notice}>
-              <Text style={styles.noticeText}>{notice}</Text>
-            </View>
-          )}
-
           <View style={styles.card}>
             <View style={styles.cardHeader}>
-              <Text style={styles.cardTitle}>Extracted details</Text>
+              <Text style={styles.cardTitle}>{machine.name}</Text>
               {flaggedCount > 0 && (
                 <View style={styles.countBadge}>
-                  <Text style={styles.countBadgeText}>
-                    {flaggedCount} to verify
-                  </Text>
+                  <Text style={styles.countBadgeText}>{flaggedCount} to verify</Text>
                 </View>
               )}
             </View>
             <Text style={styles.cardSubtitle}>
-              Everything below is editable — correct anything the scan got wrong before saving.
+              {machine.template.name} — everything below is editable, correct anything the scan
+              got wrong before saving.
             </Text>
 
-            {FIELD_META.map((field) => (
+            {templateFields.map((field) => (
               <FieldCard
                 key={field.key}
                 label={field.label}
                 value={values[field.key]}
                 placeholder={field.placeholder}
-                flag={flags[field.key]}
-                multiline={field.multiline}
-                keyboardType={field.keyboardType}
+                flag={confidenceFlags[field.key] as "low_confidence" | "not_found" | undefined}
+                keyboardType={field.keyboard_type}
                 onChange={(next) =>
                   setValues((previous) => ({ ...previous, [field.key]: next }))
                 }
@@ -153,7 +160,7 @@ export default function ResultsScreen({
                 style={styles.rawToggle}
                 onPress={() => setShowRawText((previous) => !previous)}
               >
-                <Text style={styles.rawToggleLabel}>Raw text read from the bill</Text>
+                <Text style={styles.rawToggleLabel}>Raw text read from the document</Text>
                 <Text style={styles.rawToggleAction}>{showRawText ? "Hide" : "Show"}</Text>
               </SafeButton>
               {showRawText && (
@@ -164,17 +171,21 @@ export default function ResultsScreen({
             </View>
           ) : null}
 
+          {error && (
+            <View style={styles.errorBox}>
+              <Text style={styles.errorText}>{error}</Text>
+            </View>
+          )}
+
           <View style={styles.actions}>
             <SafeButton style={styles.secondaryButton} onPress={handleCopy}>
-              <Text style={styles.secondaryButtonText}>
-                {copied ? "Copied!" : "Copy as JSON"}
-              </Text>
+              <Text style={styles.secondaryButtonText}>{copied ? "Copied!" : "Copy as JSON"}</Text>
             </SafeButton>
             <SafeButton style={styles.secondaryButton} onPress={handleShareCsv}>
               <Text style={styles.secondaryButtonText}>Export CSV</Text>
             </SafeButton>
-            <SafeButton style={styles.primaryButton} onPress={onStartOver}>
-              <Text style={styles.primaryButtonText}>Scan Another Bill</Text>
+            <SafeButton style={styles.primaryButton} onPress={handleSave} disabled={saving}>
+              <Text style={styles.primaryButtonText}>{saving ? "Saving…" : "Save Reading"}</Text>
             </SafeButton>
           </View>
         </ScrollView>
@@ -193,18 +204,6 @@ const styles = StyleSheet.create({
     padding: spacing.lg,
     paddingBottom: spacing.xxl,
     gap: spacing.md,
-  },
-  notice: {
-    backgroundColor: colors.amberTint,
-    borderWidth: 1,
-    borderColor: colors.amberBorder,
-    borderRadius: radius.md,
-    padding: spacing.lg,
-  },
-  noticeText: {
-    color: colors.amberInk,
-    fontSize: 14,
-    lineHeight: 20,
   },
   card: {
     backgroundColor: colors.white,
@@ -269,6 +268,18 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     color: colors.inkSoft,
     fontFamily: Platform.select({ ios: "Menlo", android: "monospace" }),
+  },
+  errorBox: {
+    backgroundColor: colors.roseSoft,
+    borderWidth: 1,
+    borderColor: colors.rose,
+    borderRadius: radius.md,
+    padding: spacing.md,
+  },
+  errorText: {
+    color: colors.roseInk,
+    fontSize: 13,
+    lineHeight: 18,
   },
   actions: {
     gap: spacing.sm,

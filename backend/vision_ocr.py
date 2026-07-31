@@ -5,10 +5,12 @@ Everything here works on in-memory bytes; nothing touches the filesystem.
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import io
 import logging
 import os
+import random
 
 import fitz  # PyMuPDF
 import httpx
@@ -17,6 +19,14 @@ from PIL import Image
 logger = logging.getLogger(__name__)
 
 VISION_ENDPOINT = "https://vision.googleapis.com/v1/images:annotate"
+
+# Transient conditions worth another attempt rather than failing the upload.
+RETRYABLE_HTTP_STATUSES = {429, 500, 502, 503, 504}
+# gRPC status codes Vision reports inside a 200 response:
+# 4 DEADLINE_EXCEEDED, 8 RESOURCE_EXHAUSTED, 13 INTERNAL, 14 UNAVAILABLE.
+RETRYABLE_VISION_CODES = {4, 8, 13, 14}
+BACKOFF_BASE_SECONDS = 0.6
+BACKOFF_JITTER_SECONDS = 0.4
 
 # 300 DPI relative to PyMuPDF's default 72 DPI rendering.
 PDF_RENDER_ZOOM = 300 / 72
@@ -80,11 +90,17 @@ def prepare_images(file_bytes: bytes, content_type: str) -> list[bytes]:
     return [_shrink_if_needed(file_bytes)]
 
 
-async def run_ocr(images: list[bytes], api_key: str | None = None) -> str:
+async def run_ocr(
+    images: list[bytes], api_key: str | None = None, max_attempts: int = 3
+) -> str:
     """Send images to Vision DOCUMENT_TEXT_DETECTION and return the raw text.
 
     Multiple images (e.g. two PDF pages) go out in a single batch request and
     come back joined with a page separator.
+
+    Transient failures are retried with exponential backoff. This matters most
+    for batch uploads, where several requests run at once and are more likely
+    to trip rate limits or catch a momentary 503 from Google.
     """
     api_key = api_key or os.getenv("GOOGLE_CLOUD_VISION_API_KEY")
     if not api_key:
@@ -101,27 +117,68 @@ async def run_ocr(images: list[bytes], api_key: str | None = None) -> str:
         ]
     }
 
-    try:
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                VISION_ENDPOINT, params={"key": api_key}, json=payload
+    last_error = "Vision could not be reached."
+
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        for attempt in range(1, max_attempts + 1):
+            retryable = False
+
+            try:
+                response = await client.post(
+                    VISION_ENDPOINT, params={"key": api_key}, json=payload
+                )
+            except httpx.HTTPError as exc:
+                last_error = f"Could not reach Google Cloud Vision: {exc}"
+                retryable = True
+                response = None
+
+            if response is not None:
+                if response.status_code in RETRYABLE_HTTP_STATUSES:
+                    last_error = (
+                        f"Vision API returned HTTP {response.status_code}: {response.text[:300]}"
+                    )
+                    retryable = True
+                elif response.status_code != 200:
+                    raise OcrError(
+                        f"Vision API returned HTTP {response.status_code}: {response.text[:500]}"
+                    )
+                else:
+                    body = response.json()
+                    items = body.get("responses", [])
+
+                    failed = [
+                        (index, item["error"])
+                        for index, item in enumerate(items)
+                        if isinstance(item.get("error"), dict)
+                    ]
+                    if failed:
+                        index, error = failed[0]
+                        message = error.get("message", "unknown error")
+                        if error.get("code") in RETRYABLE_VISION_CODES:
+                            last_error = f"Vision API error on page {index + 1}: {message}"
+                            retryable = True
+                        else:
+                            raise OcrError(f"Vision API error on page {index + 1}: {message}")
+                    else:
+                        pages: list[str] = []
+                        for item in items:
+                            text = (item.get("fullTextAnnotation") or {}).get("text", "")
+                            if text.strip():
+                                pages.append(text.strip())
+                        return "\n\n--- PAGE BREAK ---\n\n".join(pages)
+
+            if not retryable or attempt == max_attempts:
+                break
+
+            delay = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1))
+            delay += random.uniform(0, BACKOFF_JITTER_SECONDS)
+            logger.warning(
+                "Vision attempt %d/%d failed (%s); retrying in %.1fs",
+                attempt,
+                max_attempts,
+                last_error,
+                delay,
             )
-    except httpx.HTTPError as exc:
-        raise OcrError(f"Could not reach Google Cloud Vision: {exc}") from exc
+            await asyncio.sleep(delay)
 
-    if response.status_code != 200:
-        detail = response.text[:500]
-        raise OcrError(f"Vision API returned HTTP {response.status_code}: {detail}")
-
-    body = response.json()
-    pages: list[str] = []
-    for index, item in enumerate(body.get("responses", [])):
-        if "error" in item:
-            message = item["error"].get("message", "unknown error")
-            raise OcrError(f"Vision API error on page {index + 1}: {message}")
-
-        text = (item.get("fullTextAnnotation") or {}).get("text", "")
-        if text.strip():
-            pages.append(text.strip())
-
-    return "\n\n--- PAGE BREAK ---\n\n".join(pages)
+    raise OcrError(f"{last_error} (after {max_attempts} attempts)")

@@ -1,11 +1,10 @@
 import { useCallback, useEffect, useState } from "react";
-import { ScrollView, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, ScrollView, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
 import SafeButton from "../components/SafeButton";
-import { loadAssets, type Asset } from "../lib/assets";
-import { ASSET_CLASSES, type AssetClassId } from "../lib/assetClasses";
-import { loadReadings, type Reading } from "../lib/readings";
+import * as api from "../lib/api";
 import { useRegion } from "../lib/region";
+import type { AssetClass, Machine, Reading } from "../lib/types";
 import { colors, radius, spacing } from "../lib/theme";
 import AssetClassScreen from "./AssetClassScreen";
 import AssetDetailScreen from "./AssetDetailScreen";
@@ -16,40 +15,56 @@ interface HomeScreenProps {
 
 type HomeView =
   | { kind: "overview" }
-  | { kind: "class"; classId: AssetClassId }
-  | { kind: "asset"; asset: Asset };
+  | { kind: "class"; classId: string }
+  | { kind: "asset"; machine: Machine };
 
 export default function HomeScreen({ onScanBill }: HomeScreenProps) {
   const [view, setView] = useState<HomeView>({ kind: "overview" });
-  const [assets, setAssets] = useState<Asset[]>([]);
+  const [assetClasses, setAssetClasses] = useState<AssetClass[]>([]);
+  const [machines, setMachines] = useState<Machine[]>([]);
   const [readings, setReadings] = useState<Reading[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
   // Detected silently in the background for future region-based customization -
   // deliberately not surfaced in this screen yet.
   useRegion();
 
   const refresh = useCallback(() => {
-    void loadAssets().then(setAssets);
-    void loadReadings().then(setReadings);
+    setLoading(true);
+    setError(null);
+    Promise.all([api.getAssetClasses(), api.getMyMachines(), api.getMyReadings()])
+      .then(([classes, myMachines, myReadings]) => {
+        setAssetClasses(classes);
+        setMachines(myMachines);
+        setReadings(myReadings);
+      })
+      .catch((err) => {
+        setError(err instanceof api.ApiError ? err.message : "Could not load your data.");
+      })
+      .finally(() => setLoading(false));
   }, []);
 
-  useEffect(refresh, [refresh, view]);
+  useEffect(refresh, [refresh, view.kind]);
 
   if (view.kind === "class") {
-    return (
-      <AssetClassScreen
-        classId={view.classId}
-        onBack={() => setView({ kind: "overview" })}
-        onSelectAsset={(asset) => setView({ kind: "asset", asset })}
-      />
-    );
+    const assetClass = assetClasses.find((item) => item.id === view.classId);
+    if (assetClass) {
+      return (
+        <AssetClassScreen
+          assetClass={assetClass}
+          onBack={() => setView({ kind: "overview" })}
+          onSelectMachine={(machine) => setView({ kind: "asset", machine })}
+        />
+      );
+    }
   }
 
   if (view.kind === "asset") {
     return (
       <AssetDetailScreen
-        asset={view.asset}
-        onBack={() => setView({ kind: "class", classId: view.asset.classId })}
+        machine={view.machine}
+        onBack={() => setView({ kind: "class", classId: view.machine.template.asset_class_id })}
       />
     );
   }
@@ -69,28 +84,43 @@ export default function HomeScreen({ onScanBill }: HomeScreenProps) {
           <Text style={styles.ctaButtonText}>Scan a Bill</Text>
         </SafeButton>
 
+        {error && (
+          <View style={styles.errorBox}>
+            <Text style={styles.errorText}>{error}</Text>
+          </View>
+        )}
+
         <Text style={styles.sectionTitle}>Asset Classes</Text>
-        <View style={styles.grid}>
-          {ASSET_CLASSES.map((assetClass) => {
-            const classAssets = assets.filter((asset) => asset.classId === assetClass.id);
-            const classReadings = readings.filter((reading) => reading.classId === assetClass.id);
-            return (
-              <SafeButton
-                key={assetClass.id}
-                style={styles.classCard}
-                contentStyle={styles.classCardContent}
-                onPress={() => setView({ kind: "class", classId: assetClass.id })}
-              >
-                <Text style={styles.classIcon}>{assetClass.icon}</Text>
-                <Text style={styles.classLabel}>{assetClass.label}</Text>
-                <Text style={styles.classMeta}>
-                  {classAssets.length} asset{classAssets.length === 1 ? "" : "s"} ·{" "}
-                  {classReadings.length} reading{classReadings.length === 1 ? "" : "s"}
-                </Text>
-              </SafeButton>
-            );
-          })}
-        </View>
+
+        {loading && assetClasses.length === 0 ? (
+          <ActivityIndicator color={colors.ink} style={styles.spinner} />
+        ) : (
+          <View style={styles.grid}>
+            {assetClasses.map((assetClass) => {
+              const classMachines = machines.filter(
+                (machine) => machine.template.asset_class_id === assetClass.id
+              );
+              const classReadings = readings.filter((reading) =>
+                classMachines.some((machine) => machine.id === reading.machine_id)
+              );
+              return (
+                <SafeButton
+                  key={assetClass.id}
+                  style={styles.classCard}
+                  contentStyle={styles.classCardContent}
+                  onPress={() => setView({ kind: "class", classId: assetClass.id })}
+                >
+                  <Text style={styles.classIcon}>{assetClass.icon}</Text>
+                  <Text style={styles.classLabel}>{assetClass.label}</Text>
+                  <Text style={styles.classMeta}>
+                    {classMachines.length} asset{classMachines.length === 1 ? "" : "s"} ·{" "}
+                    {classReadings.length} reading{classReadings.length === 1 ? "" : "s"}
+                  </Text>
+                </SafeButton>
+              );
+            })}
+          </View>
+        )}
       </ScrollView>
     </SafeAreaView>
   );
@@ -150,11 +180,26 @@ const styles = StyleSheet.create({
     fontSize: 15,
     fontWeight: "700",
   },
+  errorBox: {
+    backgroundColor: colors.roseSoft,
+    borderWidth: 1,
+    borderColor: colors.rose,
+    borderRadius: radius.md,
+    padding: spacing.md,
+  },
+  errorText: {
+    color: colors.roseInk,
+    fontSize: 13,
+    lineHeight: 18,
+  },
   sectionTitle: {
     fontSize: 15,
     fontWeight: "700",
     color: colors.ink,
     marginTop: spacing.sm,
+  },
+  spinner: {
+    marginTop: spacing.xl,
   },
   grid: {
     flexDirection: "row",

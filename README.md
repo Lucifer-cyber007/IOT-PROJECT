@@ -1,41 +1,47 @@
-# Electricity Bill Extractor
+# WRV Energies — Multi-Asset IoT Monitoring Platform
 
-Upload or photograph an electricity bill (image or PDF) and get the billing details back as
-structured, editable data.
+Scan a document or gauge reading for any registered machine — an electricity bill, a UPS status
+panel, an HVAC readout — and get structured data back automatically. The platform auto-detects
+*which* machine a scan belongs to (by matching a printed serial/account/meter number against your
+registered machines) and extracts fields using that machine's own template, instead of one fixed
+schema for everything.
 
-**Pipeline:** upload → PDF rasterized with PyMuPDF (if needed) → Google Cloud Vision
-`DOCUMENT_TEXT_DETECTION` → Groq `llama-3.3-70b-versatile` field extraction → JSON.
+**Pipeline:** upload (single or up to 10 at once) → PDF rasterized with PyMuPDF (if needed) →
+Google Cloud Vision `DOCUMENT_TEXT_DETECTION` → match against your registered machines → Groq
+`llama-3.3-70b-versatile` extraction using that machine's field template → JSON.
+
+## Multi-tenant model
+
+- **Admin** provisions **clients** (tenants), defines **machine templates** (a reusable field
+  schema per machine model — e.g. "BESCOM Residential Meter" or "APC Smart-UPS 3000"), and assigns
+  **machines** (actual owned units, each with a real-world identifier) to clients.
+- **Clients** log in (web or mobile), see only their own machines, and scan documents against
+  them. Scanning is auto-detected by identifier match; if a scan can't be resolved to exactly one
+  machine, the client picks from the candidates.
+- Every machine belongs to one of 7 **asset classes**: Energy Meters, HVAC Systems, UPS, Data
+  Center, Solar Inverters, DG Sets, Pumps & Motors.
 
 ## Stack
 
 | Layer    | Tech |
 | -------- | ---- |
-| Frontend | Next.js 14 (App Router), TypeScript, Tailwind CSS, react-webcam |
-| Backend  | FastAPI, httpx |
+| Backend  | FastAPI, SQLAlchemy + SQLite, JWT auth (PyJWT + bcrypt), httpx |
+| Mobile   | Expo / React Native (SDK 54) |
+| Frontend | Next.js 14 (App Router), TypeScript, Tailwind CSS — **not yet updated** to the multi-tenant API; still the original single-file bill scanner (see Known gaps) |
 | OCR      | Google Cloud Vision API (`images:annotate`, DOCUMENT_TEXT_DETECTION) |
-| Parsing  | Groq API (`llama-3.3-70b-versatile`) |
+| Parsing  | Groq API (`llama-3.3-70b-versatile`), retried with backoff on transient failures |
 | PDF prep | PyMuPDF (fitz), rendered at ~300 DPI in memory |
 
-## Response schema
+## Data model
 
-`POST /api/extract` always returns this shape:
-
-```json
-{
-  "name": "RAMESH KUMAR S",
-  "rr_number": "HB123456",
-  "address": "No 42, 3rd Cross, Jayanagar 4th Block, Bengaluru 560011",
-  "account_number": "1234567890",
-  "units_consumed": "142",
-  "amount_to_pay": "1245.60",
-  "tariff": "LT-2(a)",
-  "bill_date": "05-03-2024",
-  "confidence_flags": { "account_number": "low_confidence" }
-}
-```
-
-Every field is a string or `null`. `confidence_flags` only lists fields needing review, with a
-value of `"low_confidence"` or `"not_found"`.
+| Table | What it is |
+| ----- | ---------- |
+| `Client` | A tenant/customer |
+| `User` | A login — `role` is `"admin"` or `"client"`; client users are scoped to one `Client` |
+| `AssetClass` | One of the 7 top-level categories (seeded once) |
+| `MachineTemplate` | A reusable field schema for a machine model — field list (key/label/normalizer type), which field is the identifier, optional custom extraction prompt guidance |
+| `Machine` | An actual owned unit — belongs to a `Client`, references a `MachineTemplate`, has its own real-world identifier value |
+| `Reading` | A captured data point for a `Machine` — OCR or manual, with the extracted fields and confidence flags |
 
 ## Setup
 
@@ -48,8 +54,9 @@ python -m venv .venv
 # source .venv/bin/activate     # macOS / Linux
 pip install -r requirements.txt
 
-cp .env.example .env            # then fill in your API keys
-uvicorn main:app --reload --port 8000
+cp .env.example .env            # fill in API keys, JWT_SECRET, admin credentials
+python seed.py                  # creates the 7 asset classes + your first admin login
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
 Get the keys from:
@@ -57,38 +64,23 @@ Get the keys from:
   <https://console.cloud.google.com/apis/credentials>
 - **Groq** — <https://console.groq.com/keys>
 
-`MOCK_MODE=1` in `.env` skips both API calls and returns fixed sample data, which is handy for
-working on the frontend or smoke-testing the server before you have keys.
+Generate a `JWT_SECRET` with `python -c "import secrets; print(secrets.token_hex(32))"`.
 
-### Frontend
-
-```bash
-cd frontend
-npm install
-cp .env.local.example .env.local
-npm run dev
-```
-
-Open <http://localhost:3000>.
+Once seeded, log in as the admin (`POST /api/auth/login`) and use the admin endpoints below to
+create a client, a machine template, and a machine — there's no admin console UI yet (see Known
+gaps), so this is curl/Postman/whatever-you-like for now.
 
 ### Mobile app (Expo / React Native)
 
-The mobile app talks to the same backend. Two things differ from the web setup:
+The backend must listen on all interfaces (`--host 0.0.0.0`, as above) and `mobile/.env` must
+point at your machine's **LAN IP**, not `localhost` — on a phone, `localhost` is the phone itself:
 
-1. The backend must listen on all interfaces, not just localhost:
-   ```bash
-   cd backend
-   .venv\Scripts\python.exe -m uvicorn main:app --host 0.0.0.0 --port 8000
-   ```
-2. `mobile/.env` must point at your machine's **LAN IP**, not `localhost` — on a phone,
-   `localhost` is the phone itself:
-   ```
-   EXPO_PUBLIC_API_BASE_URL=http://192.168.0.3:8000
-   ```
-   Find your IP with `ipconfig` (Windows) or `ifconfig` (macOS/Linux). On the Android emulator
-   you can instead use the special alias `http://10.0.2.2:8000`.
+```
+EXPO_PUBLIC_API_BASE_URL=http://192.168.0.3:8000
+```
 
-Then:
+Find your IP with `ipconfig` (Windows) or `ifconfig` (macOS/Linux). On the Android emulator you can
+instead use the special alias `http://10.0.2.2:8000`.
 
 ```bash
 cd mobile
@@ -97,9 +89,13 @@ cp .env.example .env      # then set your LAN IP
 npx expo start
 ```
 
-Scan the QR code with **Expo Go** on your phone (same Wi-Fi network), or press `a` for an Android
-emulator. Changing `.env` requires a bundler restart — `EXPO_PUBLIC_*` values are inlined at
-build time.
+Scan the QR code with **Expo Go** (same Wi-Fi network), or press `a` for an Android emulator.
+Changing `.env` requires a bundler restart — `EXPO_PUBLIC_*` values are inlined at build time.
+
+Sign in with a **client**-role login (create one via `POST /api/admin/users` with
+`"role": "client"`) — the app has no admin features, it's the client "quick access" view: browse
+your asset classes, add machines, scan (single or batch, up to 10 files), review and save
+readings.
 
 To produce an installable APK:
 
@@ -110,19 +106,34 @@ eas build -p android --profile preview
 
 ## API
 
-### `POST /api/extract`
+All endpoints except `/api/health` and `/api/auth/login` require `Authorization: Bearer <token>`.
 
-`multipart/form-data` with a single `file` field. Accepts JPG, PNG, WEBP and PDF up to 10 MB.
-For PDFs, pages 1 and 2 are rasterized and OCR'd together.
+### Auth
 
-| Status | Meaning |
-| ------ | ------- |
-| 200 | Extraction succeeded |
-| 400 | Empty or unreadable file |
-| 413 | File exceeds the size limit |
-| 415 | Unsupported file type |
-| 422 | OCR worked but the fields could not be structured — body includes `raw_text` and the UI falls back to manual entry |
-| 502 | Vision or Groq call failed |
+| Endpoint | Role | What it does |
+| -------- | ---- | ------------- |
+| `POST /api/auth/login` | — | `{email, password}` → `{access_token, role, client_id}` |
+| `GET /api/auth/me` | any | Current user info |
+
+### Admin
+
+| Endpoint | What it does |
+| -------- | ------------- |
+| `POST /api/admin/clients`, `GET /api/admin/clients` | Create / list clients |
+| `POST /api/admin/users` | Create a login (admin or client-role, scoped to a `client_id`) |
+| `GET /api/admin/asset-classes` | List the 7 seeded asset classes |
+| `POST /api/admin/machine-templates`, `GET /api/admin/machine-templates` | Create / list machine templates (field schema, identifier field, optional custom prompt, optional quirks) |
+| `POST /api/admin/machines`, `GET /api/admin/machines` | Assign a machine to any client |
+
+### Client-scoped
+
+| Endpoint | What it does |
+| -------- | ------------- |
+| `GET /api/asset-classes`, `GET /api/machine-templates` | Read-only reference data for building forms |
+| `GET /api/machines`, `POST /api/machines` | List / self-register your own machines |
+| `POST /api/scan` | Upload one document. Optional `machine_id` skips auto-detect; optional `asset_class_id` scopes candidates. Returns `{"status": "matched", "machine", "fields", "confidence_flags", "raw_text"}` or `{"status": "ambiguous"\|"no_match", "candidates", "raw_text"}` |
+| `POST /api/scan/batch` | Same, for up to `MAX_BATCH_FILES` (default 10) documents at once — repeated `files` fields, processed `BATCH_CONCURRENCY` at a time. Always 200, one result per file; nothing is persisted until you call `POST /api/readings` |
+| `POST /api/readings`, `GET /api/readings` | Save / list readings for your machines |
 
 ### `GET /api/health`
 
@@ -130,40 +141,57 @@ Reports server status and which API keys are configured.
 
 ## Notes
 
-- **Camera:** browsers only expose `getUserMedia` over HTTPS or on `localhost`. To test the
-  camera from a phone on your LAN, tunnel the dev server (e.g. `ngrok http 3000`) and point
-  `NEXT_PUBLIC_API_BASE_URL` at a matching HTTPS backend URL.
-- **CORS:** set `ALLOWED_ORIGINS` in the backend `.env` to a comma-separated list of origins
-  for production.
-- **Field accuracy:** the model is instructed never to invent values — a field it cannot find
-  comes back `null` and flagged `not_found`. Everything is editable in the results view, so the
-  user always has the last word.
+- **Auto-detect matching:** each `Machine` stores its real identifier value (serial/account/meter
+  number). A scan is matched by checking whether that value appears in the OCR text (tolerant of
+  OCR spacing noise). Zero or multiple matches fall back to letting the caller pick.
+- **Field accuracy:** the model is instructed never to invent values — a field it cannot find comes
+  back `null` and flagged `not_found`. Everything is editable before saving.
+- **Retries:** transient Vision (429/5xx/retryable gRPC codes) and Groq (429/5xx, honoring Groq's
+  stated wait time) failures are retried with backoff — this matters most for batch scans, which
+  run several requests concurrently.
+- **CORS:** set `ALLOWED_ORIGINS` in the backend `.env` to a comma-separated list of origins.
+
+## Known gaps
+
+- **No admin console UI.** Everything under `/api/admin/*` is API-only right now — provisioning a
+  client, template or machine means calling the API directly.
+- **The Next.js `frontend/` app is stale.** It still talks to the old unauthenticated single-schema
+  `/api/extract` shape and hasn't been updated for the multi-tenant API. Use the mobile app or the
+  API directly until it's rebuilt.
 
 ## Project structure
 
 ```
 backend/
-  main.py            FastAPI app, CORS, routes, file validation
-  vision_ocr.py      PDF→PNG rasterization + Google Vision call
-  llm_parser.py      Groq call, JSON extraction, schema validation + retry
+  main.py             FastAPI app, CORS, auth/admin/client routes, scan pipeline
+  auth.py              Password hashing, JWT issuance/verification, role-scoped dependencies
+  db.py                SQLAlchemy engine/session
+  models.py             Client, User, AssetClass, MachineTemplate, Machine, Reading
+  schemas.py            Pydantic request/response models
+  matching.py           Identifier-based auto-detect for scanned documents
+  seed.py                Bootstraps asset classes + first admin login
+  vision_ocr.py         PDF→PNG rasterization + Google Vision call (with retry/backoff)
+  llm_parser.py          Groq call, template-driven prompt + extraction, retry/backoff
   requirements.txt
   .env.example
-frontend/
-  app/page.tsx              INPUT → PROCESSING → RESULTS state machine
-  components/UploadPanel.tsx   Drag-and-drop + file picker with preview
-  components/CameraPanel.tsx   Live camera, capture/retake, permission errors
-  components/ResultsView.tsx   Editable fields, verify badges, JSON/CSV export
-  lib/api.ts                   Fetch wrapper for /api/extract
-  lib/types.ts                 Shared schema types and field metadata
-  .env.local.example
+frontend/                Next.js web app - stale, see Known gaps
 mobile/
-  App.tsx                      CAPTURE → PROCESSING → RESULTS state machine
-  screens/CaptureScreen.tsx    Live camera, photo library, PDF picker, permission states
-  screens/ProcessingScreen.tsx Spinner plus the error/retry state
-  screens/ResultsScreen.tsx    Editable fields, verify badges, JSON copy, CSV share
-  components/FieldCard.tsx     One labelled, editable field with its verify badge
-  lib/api.ts                   Fetch wrapper for /api/extract (with timeout)
-  lib/types.ts                 Same schema types as the web app
-  lib/theme.ts                 Shared palette/spacing
+  App.tsx                Auth gate (LoginScreen vs the tab shell) + tab navigation
+  lib/api.ts              Authenticated fetch client for every endpoint above
+  lib/authStore.ts        Session token persistence
+  lib/types.ts             Shared types (AssetClass, MachineTemplate, Machine, Reading)
+  screens/LoginScreen.tsx        Email/password sign-in
+  screens/HomeScreen.tsx          Dashboard - asset class grid with live counts
+  screens/AssetClassScreen.tsx    Machines in a class, add-machine form, entry to Batch Scan
+  screens/AssetDetailScreen.tsx   A machine's reading history, add-reading entry
+  screens/ManualEntryScreen.tsx   Generic manual reading form, driven by the machine's template
+  screens/ScanBillFlow.tsx        Single-shot scan flow (capture → auto-detect → review → save)
+  screens/BatchScanFlow.tsx       Pick up to 10 files, batch scan, resolve/review/save each
+  screens/ResultsScreen.tsx       Editable extracted fields, JSON copy, CSV share, save
+  screens/HistoryScreen.tsx       All readings across every machine
+  screens/ProfileScreen.tsx       Account info, log out
+  components/FieldCard.tsx        One labelled, editable field with its verify badge
+  components/SafeButton.tsx       Touchable wrapper (works around a device-specific paint bug)
+  components/TabBar.tsx           Home / Scan Bill / History / Profile
   .env.example
 ```

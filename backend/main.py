@@ -9,6 +9,7 @@ Reading via POST /api/readings.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import os
 
@@ -21,7 +22,7 @@ from sqlalchemy.orm import Session
 import auth
 import models
 import schemas
-from db import Base, engine, get_db
+from db import Base, SessionLocal, engine, get_db
 from llm_parser import LlmError, LlmParseError, parse_document
 from matching import find_matching_machines
 from vision_ocr import OcrError, prepare_images, run_ocr
@@ -42,6 +43,11 @@ ALLOWED_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
 
 MAX_UPLOAD_MB = int(os.getenv("MAX_UPLOAD_MB", "10"))
 MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+MAX_BATCH_FILES = int(os.getenv("MAX_BATCH_FILES", "10"))
+# Kept low deliberately: Groq's free tier caps at 12,000 tokens/minute and one
+# extraction uses roughly 2,000-2,200 of them - a handful of concurrent scans
+# can exhaust the whole budget in a single burst before any of them lands.
+BATCH_CONCURRENCY = int(os.getenv("BATCH_CONCURRENCY", "2"))
 
 
 def _allowed_origins() -> list[str]:
@@ -80,6 +86,7 @@ async def health() -> dict:
         "vision_key_configured": bool(os.getenv("GOOGLE_CLOUD_VISION_API_KEY")),
         "groq_key_configured": bool(os.getenv("GROQ_API_KEY")),
         "max_upload_mb": MAX_UPLOAD_MB,
+        "max_batch_files": MAX_BATCH_FILES,
     }
 
 
@@ -291,79 +298,73 @@ def create_my_machine(
 # --- Client: scan (OCR + auto-detect + template-driven extraction) -------
 
 
-@app.post("/api/scan")
-async def scan(
-    file: UploadFile = File(...),
-    asset_class_id: str | None = Query(None),
-    machine_id: int | None = Query(None),
-    db: Session = Depends(get_db),
-    client: models.User = Depends(auth.require_client),
-):
-    """Upload a scan for auto-detection (or pass `machine_id` to skip it).
+async def _process_one_scan(
+    db: Session,
+    client_id: int,
+    filename: str,
+    content_type: str | None,
+    file_bytes: bytes,
+    asset_class_id: str | None,
+    machine_id: int | None,
+) -> tuple[int, dict]:
+    """Validate, OCR, auto-detect and extract a single scanned document.
 
-    Returns `{"status": "matched", "machine": ..., "fields": ..., ...}` when a
-    single machine was resolved, or `{"status": "ambiguous"|"no_match",
-    "candidates": [...], "raw_text": ...}` when the caller should re-submit the
-    same image with an explicit `machine_id` from those candidates.
+    Returns `(200, payload)` for every non-error outcome - including the
+    "couldn't tell which machine" cases (`status: "ambiguous"|"no_match"`) -
+    or `(error_status, {"detail": ..., "raw_text"?: ...})` on failure. Shared
+    by the single-file and batch endpoints so validation and error wording
+    cannot drift apart between them.
     """
-    filename = file.filename or "upload"
     extension = os.path.splitext(filename)[1].lower()
-    content_type = (file.content_type or "").split(";")[0].strip().lower()
+    normalized_type = (content_type or "").split(";")[0].strip().lower()
 
-    if content_type not in ALLOWED_MIME_TYPES:
+    if normalized_type not in ALLOWED_MIME_TYPES:
         if extension not in ALLOWED_EXTENSIONS:
-            return _error(
-                415,
-                f"Unsupported file type '{content_type or extension or 'unknown'}'. "
-                "Please upload a JPG, PNG, WEBP or PDF.",
-            )
-        content_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
-    if content_type == "image/jpg":
-        content_type = "image/jpeg"
-
-    file_bytes = await file.read()
-    await file.close()
+            return 415, {
+                "detail": f"Unsupported file type '{normalized_type or extension or 'unknown'}'. "
+                "Please upload a JPG, PNG, WEBP or PDF."
+            }
+        normalized_type = "application/pdf" if extension == ".pdf" else "image/jpeg"
+    if normalized_type == "image/jpg":
+        normalized_type = "image/jpeg"
 
     if not file_bytes:
-        return _error(400, "The uploaded file is empty.")
+        return 400, {"detail": "The uploaded file is empty."}
     if len(file_bytes) > MAX_UPLOAD_BYTES:
         actual_mb = len(file_bytes) / (1024 * 1024)
-        return _error(
-            413, f"File is {actual_mb:.1f}MB, which exceeds the {MAX_UPLOAD_MB}MB limit."
-        )
+        return 413, {
+            "detail": f"File is {actual_mb:.1f}MB, which exceeds the {MAX_UPLOAD_MB}MB limit."
+        }
 
     try:
-        images = prepare_images(file_bytes, content_type)
+        images = prepare_images(file_bytes, normalized_type)
     except OcrError as exc:
-        return _error(400, str(exc))
+        return 400, {"detail": str(exc)}
     if not images:
-        return _error(400, "Could not read any pages or images from that file.")
+        return 400, {"detail": "Could not read any pages or images from that file."}
 
     try:
         ocr_text = await run_ocr(images)
     except OcrError as exc:
         logger.error("OCR failed for %s: %s", filename, exc)
-        return _error(502, f"Text extraction failed. {exc}")
+        return 502, {"detail": f"Text extraction failed. {exc}"}
 
     if not ocr_text.strip():
-        return _error(
-            422,
-            "No readable text was found in that file. Try a sharper, well-lit photo.",
-            raw_text="",
-        )
+        return 422, {
+            "detail": "No readable text was found in that file. Try a sharper, well-lit photo.",
+            "raw_text": "",
+        }
 
     if machine_id is not None:
         machine = (
             db.query(models.Machine)
-            .filter(models.Machine.id == machine_id, models.Machine.client_id == client.client_id)
+            .filter(models.Machine.id == machine_id, models.Machine.client_id == client_id)
             .first()
         )
         if not machine:
-            return _error(404, "Unknown machine_id for this client.")
+            return 404, {"detail": "Unknown machine_id for this client."}
     else:
-        candidates_query = db.query(models.Machine).filter(
-            models.Machine.client_id == client.client_id
-        )
+        candidates_query = db.query(models.Machine).filter(models.Machine.client_id == client_id)
         if asset_class_id:
             candidates_query = candidates_query.join(models.MachineTemplate).filter(
                 models.MachineTemplate.asset_class_id == asset_class_id
@@ -372,7 +373,7 @@ async def scan(
         matches = find_matching_machines(candidates, ocr_text)
 
         if len(matches) != 1:
-            return {
+            return 200, {
                 "status": "ambiguous" if len(matches) > 1 else "no_match",
                 "candidates": [
                     schemas.MachineOut.model_validate(m).model_dump(mode="json")
@@ -392,22 +393,128 @@ async def scan(
         )
     except LlmParseError as exc:
         logger.error("LLM parse failed for %s: %s", filename, exc)
-        return _error(
-            422,
-            "We read the document but could not structure the fields automatically.",
-            raw_text=ocr_text,
-        )
+        return 422, {
+            "detail": "We read the document but could not structure the fields automatically.",
+            "raw_text": ocr_text,
+        }
     except LlmError as exc:
         logger.error("LLM call failed for %s: %s", filename, exc)
-        return _error(502, f"Field extraction failed. {exc}", raw_text=ocr_text)
+        return 502, {"detail": f"Field extraction failed. {exc}", "raw_text": ocr_text}
 
     confidence_flags = extracted.pop("confidence_flags", {})
-    return {
+    return 200, {
         "status": "matched",
         "machine": schemas.MachineOut.model_validate(machine).model_dump(mode="json"),
         "fields": extracted,
         "confidence_flags": confidence_flags,
         "raw_text": ocr_text,
+    }
+
+
+@app.post("/api/scan")
+async def scan(
+    file: UploadFile = File(...),
+    asset_class_id: str | None = Query(None),
+    machine_id: int | None = Query(None),
+    db: Session = Depends(get_db),
+    client: models.User = Depends(auth.require_client),
+):
+    """Upload a scan for auto-detection (or pass `machine_id` to skip it).
+
+    Returns `{"status": "matched", "machine": ..., "fields": ..., ...}` when a
+    single machine was resolved, or `{"status": "ambiguous"|"no_match",
+    "candidates": [...], "raw_text": ...}` when the caller should re-submit the
+    same image with an explicit `machine_id` from those candidates.
+    """
+    filename = file.filename or "upload"
+    file_bytes = await file.read()
+    await file.close()
+
+    status_code, payload = await _process_one_scan(
+        db, client.client_id, filename, file.content_type, file_bytes, asset_class_id, machine_id
+    )
+    if status_code == 200:
+        return payload
+    return JSONResponse(status_code=status_code, content=payload)
+
+
+@app.post("/api/scan/batch")
+async def scan_batch(
+    files: list[UploadFile] = File(...),
+    asset_class_id: str | None = Query(None),
+    client: models.User = Depends(auth.require_client),
+):
+    """Scan up to `MAX_BATCH_FILES` documents in one request.
+
+    Always responds 200 with a per-file result, so one bad photo in a batch
+    never discards the rest:
+    ```
+    {"results": [{"index": 0, "filename": "...", "status": "matched"|"ambiguous"|"no_match"|"error", ...}],
+     "matched": N, "unresolved": N, "failed": N}
+    ```
+    Auto-detection is scoped to `asset_class_id` if given, else across all of
+    the client's machines. Nothing is persisted here - review client-side and
+    call POST /api/readings per accepted item, same as the single-file flow.
+    """
+    if not files:
+        return _error(400, "No files were uploaded.")
+    if len(files) > MAX_BATCH_FILES:
+        return _error(
+            413, f"{len(files)} files were sent, but the limit is {MAX_BATCH_FILES} per batch."
+        )
+
+    uploads: list[tuple[str, str | None, bytes]] = []
+    for upload in files:
+        uploads.append((upload.filename or "upload", upload.content_type, await upload.read()))
+        await upload.close()
+
+    semaphore = asyncio.Semaphore(max(1, BATCH_CONCURRENCY))
+    client_id = client.client_id
+
+    async def process(index: int, filename: str, content_type: str | None, data: bytes) -> dict:
+        # Each concurrent task uses its own DB session - a SQLAlchemy Session
+        # is not meant to be shared across tasks that can interleave.
+        async with semaphore:
+            db = SessionLocal()
+            try:
+                try:
+                    status_code, payload = await _process_one_scan(
+                        db, client_id, filename, content_type, data, asset_class_id, None
+                    )
+                except Exception as exc:  # noqa: BLE001 - one file must not sink the batch
+                    logger.exception("Unexpected failure processing %s", filename)
+                    return {
+                        "index": index,
+                        "filename": filename,
+                        "status": "error",
+                        "error": f"Unexpected error: {exc}",
+                    }
+            finally:
+                db.close()
+
+        if status_code == 200:
+            result = {"index": index, "filename": filename, **payload}
+            result.setdefault("status", "matched")
+            return result
+
+        return {
+            "index": index,
+            "filename": filename,
+            "status": "error",
+            "error": payload.get("detail", "Extraction failed."),
+            "raw_text": payload.get("raw_text", ""),
+        }
+
+    results = await asyncio.gather(
+        *(process(i, name, ctype, data) for i, (name, ctype, data) in enumerate(uploads))
+    )
+    ordered = sorted(results, key=lambda item: item["index"])
+
+    return {
+        "results": ordered,
+        "matched": sum(1 for item in ordered if item["status"] == "matched"),
+        "unresolved": sum(1 for item in ordered if item["status"] in ("ambiguous", "no_match")),
+        "failed": sum(1 for item in ordered if item["status"] == "error"),
     }
 
 

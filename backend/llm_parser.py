@@ -8,9 +8,11 @@ dynamically from whichever template matched the scanned document.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import os
+import random
 import re
 
 import httpx
@@ -20,7 +22,35 @@ logger = logging.getLogger(__name__)
 GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions"
 DEFAULT_MODEL = "llama-3.3-70b-versatile"
 
+# Transient conditions worth another attempt rather than failing the extraction.
+RETRYABLE_HTTP_STATUSES = {408, 429, 500, 502, 503, 504}
+BACKOFF_BASE_SECONDS = 0.6
+# Groq's 429 body names the exact wait, e.g. "Please try again in 2.6s" or "170ms".
+# Respecting that (instead of a short fixed backoff) is what actually clears a
+# token-per-minute limit; a fixed 1-2s backoff just re-hits the same window.
+RETRY_AFTER_RE = re.compile(r"try again in (\d+(?:\.\d+)?)(ms|s)\b", re.IGNORECASE)
+MAX_RETRY_AFTER_SECONDS = 20.0
+
 VALID_FLAGS = {"low_confidence", "not_found"}
+
+
+def _retry_after_seconds(response: httpx.Response) -> float | None:
+    """Extract Groq's suggested wait time from a 429, in seconds."""
+    header = response.headers.get("retry-after")
+    if header:
+        try:
+            return min(float(header), MAX_RETRY_AFTER_SECONDS)
+        except ValueError:
+            pass
+
+    match = RETRY_AFTER_RE.search(response.text)
+    if match:
+        value = float(match.group(1))
+        if match.group(2).lower() == "ms":
+            value /= 1000
+        return min(value, MAX_RETRY_AFTER_SECONDS)
+
+    return None
 
 RETRY_REMINDER = (
     "\n\nYour previous response was not valid JSON. Return JSON ONLY: start with { and end with }. "
@@ -378,30 +408,76 @@ def validate_and_normalize(
 
 
 async def _call_groq(
-    client: httpx.AsyncClient, api_key: str, model: str, system_prompt: str, ocr_text: str
+    client: httpx.AsyncClient,
+    api_key: str,
+    model: str,
+    system_prompt: str,
+    ocr_text: str,
+    max_attempts: int = 5,
 ) -> str:
-    response = await client.post(
-        GROQ_ENDPOINT,
-        headers={"Authorization": f"Bearer {api_key}"},
-        json={
-            "model": model,
-            "temperature": 0,
-            "response_format": {"type": "json_object"},
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": f"Raw OCR text of the document:\n\n{ocr_text}"},
-            ],
-        },
-    )
+    """Call Groq, retrying transient failures.
 
-    if response.status_code != 200:
-        raise LlmError(f"Groq API returned HTTP {response.status_code}: {response.text[:500]}")
+    Batch scans run several extractions at once, which makes it easy to trip
+    Groq's tokens-per-minute limit even though each individual call is well
+    within it. On a 429, Groq's response body states exactly how long the
+    caller must wait for the window to clear (e.g. "try again in 2.6s") - that
+    is honored here rather than guessed at with a short fixed backoff, which
+    would just retry into the same exhausted window and burn all attempts
+    before the quota actually recovers.
+    """
+    request = {
+        "model": model,
+        "temperature": 0,
+        "response_format": {"type": "json_object"},
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": f"Raw OCR text of the document:\n\n{ocr_text}"},
+        ],
+    }
 
-    body = response.json()
-    try:
-        return body["choices"][0]["message"]["content"] or ""
-    except (KeyError, IndexError, TypeError) as exc:
-        raise LlmError(f"Unexpected Groq response shape: {body}") from exc
+    last_error = "Groq could not be reached."
+
+    for attempt in range(1, max_attempts + 1):
+        retry_after: float | None = None
+
+        try:
+            response = await client.post(
+                GROQ_ENDPOINT, headers={"Authorization": f"Bearer {api_key}"}, json=request
+            )
+        except httpx.HTTPError as exc:
+            last_error = f"Could not reach Groq: {exc}"
+        else:
+            if response.status_code == 200:
+                body = response.json()
+                try:
+                    return body["choices"][0]["message"]["content"] or ""
+                except (KeyError, IndexError, TypeError) as exc:
+                    raise LlmError(f"Unexpected Groq response shape: {body}") from exc
+
+            last_error = f"Groq API returned HTTP {response.status_code}: {response.text[:400]}"
+            if response.status_code not in RETRYABLE_HTTP_STATUSES:
+                raise LlmError(last_error)
+            if response.status_code == 429:
+                retry_after = _retry_after_seconds(response)
+
+        if attempt == max_attempts:
+            break
+
+        if retry_after is not None:
+            delay = retry_after + random.uniform(0.05, 0.3)
+        else:
+            delay = BACKOFF_BASE_SECONDS * (2 ** (attempt - 1)) + random.uniform(0, 0.4)
+
+        logger.warning(
+            "Groq attempt %d/%d failed (%s); retrying in %.1fs",
+            attempt,
+            max_attempts,
+            last_error,
+            delay,
+        )
+        await asyncio.sleep(delay)
+
+    raise LlmError(f"{last_error} (after {max_attempts} attempts)")
 
 
 async def parse_document(

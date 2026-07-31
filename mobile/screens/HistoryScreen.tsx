@@ -1,9 +1,8 @@
-import { useEffect, useState } from "react";
-import { FlatList, StyleSheet, Text, View } from "react-native";
+import { useCallback, useEffect, useState } from "react";
+import { ActivityIndicator, FlatList, StyleSheet, Text, View } from "react-native";
 import { SafeAreaView } from "react-native-safe-area-context";
-import { loadAssets, type Asset } from "../lib/assets";
-import { getAssetClass } from "../lib/assetClasses";
-import { loadReadings, type Reading } from "../lib/readings";
+import * as api from "../lib/api";
+import type { Machine, Reading } from "../lib/types";
 import { colors, radius, spacing } from "../lib/theme";
 
 function formatDateTime(iso: string): string {
@@ -16,18 +15,16 @@ function formatDateTime(iso: string): string {
   });
 }
 
-function EntryCard({ reading, asset }: { reading: Reading; asset: Asset | undefined }) {
-  const assetClass = getAssetClass(reading.classId);
-  const primaryFields = assetClass.fields.slice(0, 3);
+function EntryCard({ reading, machine }: { reading: Reading; machine: Machine | undefined }) {
+  const templateFields = machine?.template.fields.slice(0, 3) ?? [];
   return (
     <View style={styles.card}>
       <Text style={styles.cardDate}>
-        {formatDateTime(reading.capturedAt)} · {reading.captureMethod === "ocr" ? "Scanned" : "Manual"}
+        {formatDateTime(reading.captured_at)} ·{" "}
+        {reading.capture_method === "ocr" ? "Scanned" : "Manual"}
       </Text>
-      <Text style={styles.cardName}>
-        {assetClass.icon} {asset?.name ?? "Unknown asset"} — {assetClass.label}
-      </Text>
-      {primaryFields.map((field) => (
+      <Text style={styles.cardName}>{machine ? machine.name : "Unknown asset"}</Text>
+      {templateFields.map((field) => (
         <View key={field.key} style={styles.cardRow}>
           <Text style={styles.cardLabel}>{field.label}</Text>
           <Text style={styles.cardValue}>{reading.fields[field.key] ?? "—"}</Text>
@@ -39,37 +36,56 @@ function EntryCard({ reading, asset }: { reading: Reading; asset: Asset | undefi
 
 export default function HistoryScreen() {
   const [readings, setReadings] = useState<Reading[]>([]);
-  const [assets, setAssets] = useState<Asset[]>([]);
+  const [machines, setMachines] = useState<Machine[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
 
-  useEffect(() => {
-    let mounted = true;
-    loadReadings().then((data) => {
-      if (mounted) setReadings(data);
-    });
-    loadAssets().then((data) => {
-      if (mounted) setAssets(data);
-    });
-    return () => {
-      mounted = false;
-    };
+  const refresh = useCallback(() => {
+    setLoading(true);
+    setError(null);
+    Promise.all([api.getMyReadings(), api.getMyMachines()])
+      .then(([myReadings, myMachines]) => {
+        setReadings(myReadings);
+        setMachines(myMachines);
+      })
+      .catch((err) => {
+        setError(err instanceof api.ApiError ? err.message : "Could not load history.");
+      })
+      .finally(() => setLoading(false));
   }, []);
+
+  useEffect(refresh, [refresh]);
 
   return (
     <SafeAreaView style={styles.screen} edges={["top", "bottom"]}>
       <Text style={styles.heading}>Scan History</Text>
-      <FlatList
-        data={readings}
-        keyExtractor={(item) => item.id}
-        contentContainerStyle={styles.listContent}
-        renderItem={({ item }) => (
-          <EntryCard reading={item} asset={assets.find((asset) => asset.id === item.assetId)} />
-        )}
-        ListEmptyComponent={
-          <View style={styles.empty}>
-            <Text style={styles.emptyText}>No readings recorded yet.</Text>
-          </View>
-        }
-      />
+
+      {error && (
+        <View style={styles.errorBox}>
+          <Text style={styles.errorText}>{error}</Text>
+        </View>
+      )}
+
+      {loading ? (
+        <ActivityIndicator color={colors.ink} style={styles.spinner} />
+      ) : (
+        <FlatList
+          data={readings}
+          keyExtractor={(item) => String(item.id)}
+          contentContainerStyle={styles.listContent}
+          renderItem={({ item }) => (
+            <EntryCard
+              reading={item}
+              machine={machines.find((machine) => machine.id === item.machine_id)}
+            />
+          )}
+          ListEmptyComponent={
+            <View style={styles.empty}>
+              <Text style={styles.emptyText}>No readings recorded yet.</Text>
+            </View>
+          }
+        />
+      )}
     </SafeAreaView>
   );
 }
@@ -86,6 +102,23 @@ const styles = StyleSheet.create({
     paddingHorizontal: spacing.lg,
     paddingTop: spacing.md,
     paddingBottom: spacing.sm,
+  },
+  errorBox: {
+    marginHorizontal: spacing.lg,
+    backgroundColor: colors.roseSoft,
+    borderWidth: 1,
+    borderColor: colors.rose,
+    borderRadius: radius.md,
+    padding: spacing.md,
+    marginBottom: spacing.sm,
+  },
+  errorText: {
+    color: colors.roseInk,
+    fontSize: 13,
+    lineHeight: 18,
+  },
+  spinner: {
+    marginTop: spacing.xl,
   },
   listContent: {
     padding: spacing.lg,
