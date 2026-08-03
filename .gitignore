@@ -5,6 +5,14 @@ __pycache__/
 venv/
 env/
 
+# Local SQLite database
+*.db
+*.db-journal
+
+# Local run logs
+backend/backend.log
+mobile/metro.log
+
 # Environment
 .env
 .env.local

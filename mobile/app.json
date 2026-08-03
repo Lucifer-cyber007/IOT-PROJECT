@@ -1,22 +1,23 @@
 {
   "expo": {
-    "name": "Bill Extractor",
-    "slug": "electricity-bill-extractor",
+    "name": "WRV Energies",
+    "slug": "wrv-energies",
     "version": "1.0.0",
     "orientation": "portrait",
     "icon": "./assets/icon.png",
-    "scheme": "billextractor",
+    "scheme": "wrvenergies",
     "userInterfaceStyle": "light",
     "ios": {
       "supportsTablet": true,
-      "bundleIdentifier": "com.billextractor.app",
+      "bundleIdentifier": "com.wrvenergies.app",
       "infoPlist": {
-        "NSCameraUsageDescription": "Bill Extractor uses the camera to photograph your electricity bill so the details can be read from it.",
-        "NSPhotoLibraryUsageDescription": "Bill Extractor needs access to your photos so you can pick a saved bill image."
+        "NSCameraUsageDescription": "WRV Energies uses the camera to photograph your electricity bill so the details can be read from it.",
+        "NSPhotoLibraryUsageDescription": "WRV Energies needs access to your photos so you can pick a saved bill image.",
+        "NSLocationWhenInUseUsageDescription": "WRV Energies uses your location to detect your region for energy monitoring."
       }
     },
     "android": {
-      "package": "com.billextractor.app",
+      "package": "com.wrvenergies.app",
       "adaptiveIcon": {
         "backgroundColor": "#0f172a",
         "foregroundImage": "./assets/android-icon-foreground.png",
@@ -33,13 +34,19 @@
       [
         "expo-camera",
         {
-          "cameraPermission": "Allow Bill Extractor to use the camera to photograph your electricity bill."
+          "cameraPermission": "Allow WRV Energies to use the camera to photograph your electricity bill."
         }
       ],
       [
         "expo-image-picker",
         {
-          "photosPermission": "Allow Bill Extractor to access your photos so you can pick a saved bill image."
+          "photosPermission": "Allow WRV Energies to access your photos so you can pick a saved bill image."
+        }
+      ],
+      [
+        "expo-location",
+        {
+          "locationWhenInUsePermission": "Allow WRV Energies to use your location to detect your region."
         }
       ]
     ]

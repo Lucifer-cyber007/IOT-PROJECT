@@ -99,8 +99,8 @@ async def run_ocr(
     come back joined with a page separator.
 
     Transient failures are retried with exponential backoff. This matters most
-    for batch uploads, where several requests run at once and are more likely to
-    trip rate limits or catch a momentary 503 from Google.
+    for batch uploads, where several requests run at once and are more likely
+    to trip rate limits or catch a momentary 503 from Google.
     """
     api_key = api_key or os.getenv("GOOGLE_CLOUD_VISION_API_KEY")
     if not api_key:
@@ -158,9 +158,7 @@ async def run_ocr(
                             last_error = f"Vision API error on page {index + 1}: {message}"
                             retryable = True
                         else:
-                            raise OcrError(
-                                f"Vision API error on page {index + 1}: {message}"
-                            )
+                            raise OcrError(f"Vision API error on page {index + 1}: {message}")
                     else:
                         pages: list[str] = []
                         for item in items:

@@ -1,84 +1,62 @@
+import { useState } from "react";
+import { ActivityIndicator } from "react-native";
 import { StatusBar } from "expo-status-bar";
-import { useCallback, useRef, useState } from "react";
+import { StyleSheet, View } from "react-native";
 import { SafeAreaProvider } from "react-native-safe-area-context";
-import CaptureScreen from "./screens/CaptureScreen";
-import ProcessingScreen from "./screens/ProcessingScreen";
-import ResultsScreen from "./screens/ResultsScreen";
-import { extractBill, type PickedFile } from "./lib/api";
-import { EMPTY_RESULT, type ExtractionResult } from "./lib/types";
-
-type Stage = "capture" | "processing" | "results";
-
-interface Results {
-  data: ExtractionResult;
-  rawText?: string;
-  notice?: string;
-}
+import TabBar, { type TabKey } from "./components/TabBar";
+import { colors } from "./lib/theme";
+import { useAuthSession } from "./lib/authStore";
+import HistoryScreen from "./screens/HistoryScreen";
+import HomeScreen from "./screens/HomeScreen";
+import LoginScreen from "./screens/LoginScreen";
+import ProfileScreen from "./screens/ProfileScreen";
+import ScanBillFlow from "./screens/ScanBillFlow";
 
 export default function App() {
-  const [stage, setStage] = useState<Stage>("capture");
-  const [results, setResults] = useState<Results | null>(null);
-  const [errorMessage, setErrorMessage] = useState<string | null>(null);
-  const lastFileRef = useRef<PickedFile | null>(null);
+  const [activeTab, setActiveTab] = useState<TabKey>("home");
+  const { session, login, logout } = useAuthSession();
 
-  const runExtraction = useCallback(async (file: PickedFile) => {
-    lastFileRef.current = file;
-    setStage("processing");
-    setErrorMessage(null);
+  if (session === undefined) {
+    return (
+      <SafeAreaProvider>
+        <View style={styles.loading}>
+          <ActivityIndicator color={colors.ink} />
+        </View>
+      </SafeAreaProvider>
+    );
+  }
 
-    try {
-      const outcome = await extractBill(file);
-      if (outcome.kind === "success") {
-        setResults({ data: outcome.data });
-      } else {
-        setResults({
-          data: EMPTY_RESULT,
-          rawText: outcome.rawText,
-          notice: outcome.message,
-        });
-      }
-      setStage("results");
-    } catch (error) {
-      // Stay on the processing screen, which renders its own error state.
-      setErrorMessage(
-        error instanceof Error ? error.message : "Something went wrong. Please try again."
-      );
-    }
-  }, []);
-
-  const startOver = () => {
-    lastFileRef.current = null;
-    setResults(null);
-    setErrorMessage(null);
-    setStage("capture");
-  };
-
-  const retry = () => {
-    if (lastFileRef.current) {
-      void runExtraction(lastFileRef.current);
-    } else {
-      startOver();
-    }
-  };
+  if (session === null) {
+    return (
+      <SafeAreaProvider>
+        <StatusBar style="dark" />
+        <LoginScreen onLogin={login} />
+      </SafeAreaProvider>
+    );
+  }
 
   return (
     <SafeAreaProvider>
-      <StatusBar style={stage === "capture" ? "light" : "dark"} />
-
-      {stage === "capture" && <CaptureScreen onSubmit={runExtraction} />}
-
-      {stage === "processing" && (
-        <ProcessingScreen error={errorMessage} onRetry={retry} onStartOver={startOver} />
-      )}
-
-      {stage === "results" && results && (
-        <ResultsScreen
-          result={results.data}
-          rawText={results.rawText}
-          notice={results.notice}
-          onStartOver={startOver}
-        />
-      )}
+      {activeTab !== "scan" && <StatusBar style="dark" />}
+      <View style={styles.content}>
+        {activeTab === "home" && <HomeScreen onScanBill={() => setActiveTab("scan")} />}
+        {activeTab === "scan" && <ScanBillFlow />}
+        {activeTab === "history" && <HistoryScreen />}
+        {activeTab === "profile" && <ProfileScreen onLogout={logout} />}
+      </View>
+      <TabBar active={activeTab} onChange={setActiveTab} />
     </SafeAreaProvider>
   );
 }
+
+const styles = StyleSheet.create({
+  content: {
+    flex: 1,
+  },
+  loading: {
+    flex: 1,
+    alignItems: "center",
+    justifyContent: "center",
+    backgroundColor: colors.slate50,
+  },
+});
