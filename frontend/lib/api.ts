@@ -1,4 +1,5 @@
-import type { ExtractionResult } from "./types";
+import type { BillEntry, ExtractionResult } from "./types";
+import { EMPTY_RESULT } from "./types";
 
 const API_BASE_URL = (
   process.env.NEXT_PUBLIC_API_BASE_URL ?? "http://localhost:8000"
@@ -82,4 +83,105 @@ export async function extractBill(
   }
 
   return { kind: "success", data: body as ExtractionResult };
+}
+
+interface BatchItem {
+  index: number;
+  filename: string;
+  status: "ok" | "error";
+  data?: ExtractionResult;
+  error?: string;
+  raw_text?: string;
+}
+
+/** Send several bills in one request; the server extracts them concurrently. */
+export async function extractBills(
+  files: File[],
+  signal?: AbortSignal
+): Promise<BillEntry[]> {
+  const formData = new FormData();
+  files.forEach((file) => formData.append("files", file, file.name));
+
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/extract-batch`, {
+      method: "POST",
+      body: formData,
+      signal,
+    });
+  } catch (error) {
+    if (error instanceof DOMException && error.name === "AbortError") throw error;
+    throw new ApiError(
+      `Could not reach the server at ${API_BASE_URL}. Check that the backend is running.`,
+      0
+    );
+  }
+
+  let body: unknown = null;
+  try {
+    body = await response.json();
+  } catch {
+    // Handled below.
+  }
+
+  if (!response.ok) {
+    throw new ApiError(
+      readDetail(body, `The server returned an error (HTTP ${response.status}).`),
+      response.status
+    );
+  }
+
+  const items = ((body as { results?: BatchItem[] })?.results ?? []) as BatchItem[];
+
+  return items.map((item, position) => ({
+    id: `${item.index ?? position}-${item.filename}`,
+    fileName: item.filename,
+    status: item.status,
+    data: item.status === "ok" && item.data ? item.data : EMPTY_RESULT,
+    error: item.status === "error" ? item.error : undefined,
+    rawText: item.raw_text || undefined,
+  }));
+}
+
+/** Post the on-screen (possibly edited) rows and download the .xlsx the server builds. */
+export async function downloadExcel(
+  rows: Array<Record<string, string | null>>,
+  filename: string
+): Promise<void> {
+  let response: Response;
+  try {
+    response = await fetch(`${API_BASE_URL}/api/export/xlsx`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ rows, filename }),
+    });
+  } catch {
+    throw new ApiError(
+      `Could not reach the server at ${API_BASE_URL} to build the spreadsheet.`,
+      0
+    );
+  }
+
+  if (!response.ok) {
+    let body: unknown = null;
+    try {
+      body = await response.json();
+    } catch {
+      // Fall through to the generic message.
+    }
+    throw new ApiError(
+      readDetail(body, `The export failed (HTTP ${response.status}).`),
+      response.status
+    );
+  }
+
+  const blob = await response.blob();
+  const url = URL.createObjectURL(blob);
+  const anchor = document.createElement("a");
+  anchor.href = url;
+  anchor.download = filename;
+  document.body.appendChild(anchor);
+  anchor.click();
+  document.body.removeChild(anchor);
+  URL.revokeObjectURL(url);
 }

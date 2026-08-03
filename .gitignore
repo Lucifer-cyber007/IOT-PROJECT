@@ -11,11 +11,16 @@ env/
 
 # Local run logs
 backend/backend.log
+mobile/metro.log
 
 # Environment
 .env
 .env.local
 *.local
+
+# GCP service account keys (Vertex AI credentials) - never commit these
+*service-account*.json
+*-key.json
 
 # Node / Next.js
 node_modules/
