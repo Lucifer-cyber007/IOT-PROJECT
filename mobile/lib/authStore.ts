@@ -3,7 +3,7 @@ import { useCallback, useEffect, useState } from "react";
 
 export interface AuthSession {
   token: string;
-  role: "admin" | "client";
+  role: "admin" | "client_admin" | "technician";
   clientId: number | null;
 }
 

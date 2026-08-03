@@ -25,7 +25,7 @@ class TokenResponse(BaseModel):
 class UserCreate(BaseModel):
     email: str
     password: str
-    role: str  # "admin" | "client"
+    role: str  # "admin" | "client_admin" | "technician"
     client_id: int | None = None
 
 
@@ -35,6 +35,7 @@ class UserOut(BaseModel):
     email: str
     role: str
     client_id: int | None = None
+    status: str = "active"
 
 
 # --- Clients / asset classes ---------------------------------------------------
@@ -115,6 +116,117 @@ class MachineOut(BaseModel):
     identifier_value: str
     created_at: datetime
     template: MachineTemplateOut
+
+
+# --- Account requests / technicians -------------------------------------------
+
+
+class AccountRequestCreate(BaseModel):
+    full_name: str
+    email: str
+    phone: str | None = None
+    role: str  # "client_admin" | "technician"
+    employee_id: str | None = None
+    department: str | None = None
+    machine_ids: list[int] = []  # only meaningful when role == "technician"
+
+
+class AccountRequestOut(BaseModel):
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    client_id: int
+    requested_by_user_id: int
+    full_name: str
+    email: str
+    phone: str | None
+    role: str
+    employee_id: str | None
+    department: str | None
+    machine_ids: list[int]
+    status: str
+    admin_note: str | None
+    decided_by_user_id: int | None
+    decided_at: datetime | None
+    created_at: datetime
+
+
+class AccountRequestApprove(BaseModel):
+    password: str
+
+
+class AccountRequestReject(BaseModel):
+    admin_note: str
+
+
+class TechnicianOut(BaseModel):
+    id: int
+    email: str
+    status: str
+    machines: list[MachineOut]
+    reading_count: int
+    last_reading_at: datetime | None
+
+
+class TechnicianMachinesUpdate(BaseModel):
+    machine_ids: list[int]
+
+
+class TechnicianStatusUpdate(BaseModel):
+    status: str  # "active" | "suspended"
+
+
+# --- Dashboard / analytics ------------------------------------------------------
+
+
+class TrendPoint(BaseModel):
+    captured_at: datetime
+    value: float
+    is_anomaly: bool
+
+
+class MachineTrend(BaseModel):
+    field_key: str
+    field_label: str
+    points: list[TrendPoint]
+
+
+class AnomalyFlag(BaseModel):
+    machine_id: int
+    machine_name: str
+    field_label: str
+    captured_at: datetime
+    value: float
+    previous_value: float
+
+
+class OverdueMachine(BaseModel):
+    machine_id: int
+    name: str
+    last_reading_at: datetime | None
+
+
+class DashboardSummary(BaseModel):
+    total_machines: int
+    technician_count: int
+    readings_this_week: int
+    readings_this_month: int
+    overdue_machines: list[OverdueMachine]
+    recent_anomalies: list[AnomalyFlag]
+
+
+class ClientBreakdown(BaseModel):
+    client_id: int
+    name: str
+    machine_count: int
+    reading_count: int
+
+
+class AdminDashboardSummary(BaseModel):
+    total_clients: int
+    total_machines: int
+    total_readings: int
+    readings_this_week: int
+    per_client: list[ClientBreakdown]
 
 
 # --- Readings / scan ---------------------------------------------------------

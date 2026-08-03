@@ -152,14 +152,14 @@ export function fileNameFrom(uri: string, fallback: string): string {
 
 export interface LoginResult {
   token: string;
-  role: "admin" | "client";
+  role: "admin" | "client_admin" | "technician";
   clientId: number | null;
 }
 
 export async function login(email: string, password: string): Promise<LoginResult> {
   const body = await request<{
     access_token: string;
-    role: "admin" | "client";
+    role: "admin" | "client_admin" | "technician";
     client_id: number | null;
   }>("/api/auth/login", { method: "POST", body: { email, password }, auth: false });
   return { token: body.access_token, role: body.role, clientId: body.client_id };

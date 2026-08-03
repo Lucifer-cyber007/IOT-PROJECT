@@ -1,10 +1,12 @@
 import type { Metadata, Viewport } from "next";
+import AuthProvider from "../components/AuthProvider";
+import ToastProvider from "../components/Toast";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Electricity Bill Extractor",
+  title: "WRV Energies — Portal",
   description:
-    "Upload or photograph an electricity bill and get the billing details as structured data.",
+    "Scan or manually log readings for your registered machines and review reading history.",
 };
 
 export const viewport: Viewport = {
@@ -20,7 +22,11 @@ export default function RootLayout({
 }) {
   return (
     <html lang="en">
-      <body>{children}</body>
+      <body>
+        <AuthProvider>
+          <ToastProvider>{children}</ToastProvider>
+        </AuthProvider>
+      </body>
     </html>
   );
 }

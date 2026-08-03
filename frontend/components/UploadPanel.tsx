@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 
 const MAX_FILE_BYTES = 10 * 1024 * 1024;
-const MAX_FILES = 25;
+export const DEFAULT_MAX_FILES = 10;
 
 const ACCEPTED_MIME = [
   "image/jpeg",
@@ -44,16 +44,23 @@ interface UploadPanelProps {
   queue: QueuedFile[];
   onQueueChange: (next: QueuedFile[]) => void;
   onSubmit: () => void;
+  maxFiles?: number;
+  submitLabel?: string;
+  itemLabel?: string;
 }
 
 export default function UploadPanel({
   queue,
   onQueueChange,
   onSubmit,
+  maxFiles = DEFAULT_MAX_FILES,
+  submitLabel,
+  itemLabel = "file",
 }: UploadPanelProps) {
   const [error, setError] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
+  const MAX_FILES = maxFiles;
 
   const addFiles = useCallback(
     (incoming: FileList | File[]) => {
@@ -79,7 +86,7 @@ export default function UploadPanel({
 
       const room = MAX_FILES - queue.length;
       if (accepted.length > room) {
-        problems.push(`Only ${MAX_FILES} bills can be processed at once.`);
+        problems.push(`Only ${MAX_FILES} ${itemLabel}s can be processed at once.`);
         accepted.splice(Math.max(0, room));
       }
 
@@ -130,17 +137,17 @@ export default function UploadPanel({
         }}
         role="button"
         tabIndex={0}
-        aria-label="Choose bill files to upload"
-        className={`flex cursor-pointer flex-col items-center justify-center rounded-xl border-2 border-dashed px-6 text-center transition-colors focus:outline-none focus:ring-2 focus:ring-slate-900 focus:ring-offset-2 ${
+        aria-label={`Choose ${itemLabel} files to upload`}
+        className={`flex cursor-pointer flex-col items-center justify-center rounded-2xl border-2 border-dashed px-6 text-center transition-colors focus:outline-none focus:ring-4 focus:ring-indigo-500/10 ${
           queue.length ? "py-7" : "py-12"
         } ${
           isDragging
-            ? "border-slate-900 bg-slate-100"
-            : "border-slate-300 bg-slate-50 hover:border-slate-400 hover:bg-slate-100"
+            ? "border-indigo-500 bg-indigo-50"
+            : "border-slate-200 bg-slate-50 hover:border-indigo-300 hover:bg-indigo-50/40"
         }`}
       >
         <svg
-          className="mb-3 h-9 w-9 text-slate-400"
+          className={`mb-3 h-9 w-9 ${isDragging ? "text-indigo-500" : "text-slate-400"}`}
           fill="none"
           viewBox="0 0 24 24"
           stroke="currentColor"
@@ -154,7 +161,7 @@ export default function UploadPanel({
           />
         </svg>
         <p className="text-sm font-medium text-slate-700">
-          {queue.length ? "Add more bills" : "Drop your bills here, or "}
+          {queue.length ? `Add more ${itemLabel}s` : `Drop your ${itemLabel}s here, or `}
           {!queue.length && <span className="underline">browse</span>}
         </p>
         <p className="mt-1 text-xs text-slate-500">
@@ -174,10 +181,11 @@ export default function UploadPanel({
       />
 
       {queue.length > 0 && (
-        <div className="rounded-xl border border-slate-200 bg-white">
+        <div className="rounded-2xl border border-slate-200 bg-white">
           <div className="flex items-center justify-between border-b border-slate-100 px-4 py-2.5">
             <p className="text-sm font-semibold text-slate-900">
-              {queue.length} bill{queue.length === 1 ? "" : "s"} ready
+              {queue.length} {itemLabel}
+              {queue.length === 1 ? "" : "s"} ready
             </p>
             <button
               type="button"
@@ -233,7 +241,7 @@ export default function UploadPanel({
       )}
 
       {error && (
-        <p role="alert" className="rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">
+        <p role="alert" className="rounded-xl border border-rose-200 bg-rose-50 px-3.5 py-2.5 text-sm text-rose-700">
           {error}
         </p>
       )}
@@ -242,9 +250,9 @@ export default function UploadPanel({
         type="button"
         disabled={queue.length === 0}
         onClick={onSubmit}
-        className="w-full rounded-lg bg-slate-900 px-4 py-3 text-sm font-semibold text-white transition-colors hover:bg-slate-800 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400"
+        className="w-full rounded-xl bg-indigo-600 px-4 py-3 text-sm font-semibold text-white shadow-sm shadow-indigo-600/30 transition-colors hover:bg-indigo-700 disabled:cursor-not-allowed disabled:bg-slate-200 disabled:text-slate-400 disabled:shadow-none"
       >
-        {queue.length > 1 ? `Extract ${queue.length} Bills` : "Extract Details"}
+        {submitLabel ?? (queue.length > 1 ? `Scan ${queue.length} Files` : "Scan")}
       </button>
     </div>
   );

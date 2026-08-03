@@ -12,7 +12,7 @@ from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 
 from db import get_db
-from models import User
+from models import TechnicianMachineAccess, User
 
 JWT_ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_HOURS = 24 * 7
@@ -62,6 +62,10 @@ def get_current_user(
     user = db.get(User, int(payload["sub"]))
     if user is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found.")
+    if user.status == "suspended":
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="This account has been suspended."
+        )
     return user
 
 
@@ -71,9 +75,33 @@ def require_admin(user: User = Depends(get_current_user)) -> User:
     return user
 
 
-def require_client(user: User = Depends(get_current_user)) -> User:
-    if user.role != "client" or user.client_id is None:
+def require_org_member(user: User = Depends(get_current_user)) -> User:
+    """Any authenticated user in a client organization - client_admin or technician."""
+    if user.role not in ("client_admin", "technician") or user.client_id is None:
         raise HTTPException(
             status_code=status.HTTP_403_FORBIDDEN, detail="Client access required."
         )
     return user
+
+
+def require_client_admin(user: User = Depends(get_current_user)) -> User:
+    """Org-management actions - requesting/approving logins, managing technicians."""
+    if user.role != "client_admin" or user.client_id is None:
+        raise HTTPException(
+            status_code=status.HTTP_403_FORBIDDEN, detail="Client admin access required."
+        )
+    return user
+
+
+def accessible_machine_ids(db: Session, user: User) -> set[int] | None:
+    """The set of machine IDs `user` may see, or `None` meaning "all of their client's".
+
+    A client_admin has implicit access to every machine in their own client. A
+    technician is narrowed down to whatever `TechnicianMachineAccess` grants them.
+    """
+    if user.role == "client_admin":
+        return None
+    rows = db.query(TechnicianMachineAccess.machine_id).filter(
+        TechnicianMachineAccess.user_id == user.id
+    )
+    return {machine_id for (machine_id,) in rows}
